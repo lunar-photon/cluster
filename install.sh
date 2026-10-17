@@ -14,17 +14,20 @@ echo "Installing cluster suite..."
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$CONFIG_DIR"
 
-# Install jupyter-forward in dedicated venv if not already installed
-if ! command -v jupyter-forward >/dev/null 2>&1 && [[ ! -x "$VENV_DIR/bin/jupyter-forward" ]]; then
-    echo "Setting up virtual environment for jupyter-forward in $VENV_DIR..."
+# Install jupyter-forward and textual in dedicated venv
+if ! command -v jupyter-forward >/dev/null 2>&1 || [[ ! -x "$VENV_DIR/bin/jupyter-forward" ]]; then
+    echo "Setting up virtual environment for cluster suite in $VENV_DIR..."
     python3 -m venv "$VENV_DIR"
     "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install jupyter-forward
+    "$VENV_DIR/bin/pip" install jupyter-forward textual
 fi
 
-# Copy cluster script
+# Copy cluster executables
 cp -f "$(dirname "$0")/cluster" "$INSTALL_DIR/cluster"
 chmod +x "$INSTALL_DIR/cluster"
+
+cp -f "$(dirname "$0")/cluster_tui.py" "$INSTALL_DIR/cluster_tui.py"
+chmod +x "$INSTALL_DIR/cluster_tui.py"
 
 # Create cluster-jupyter backward compatibility wrapper
 cat << 'EOF' > "$INSTALL_DIR/cluster-jupyter"
@@ -42,4 +45,4 @@ fi
 
 echo "Installation complete!"
 echo "Make sure $INSTALL_DIR is in your PATH."
-echo "Run 'cluster' to get started."
+echo "Run 'cluster' to launch the TUI dashboard."

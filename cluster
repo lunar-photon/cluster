@@ -659,6 +659,32 @@ EOF
     fi
 }
 
+launch_tui() {
+    local PYTHON=""
+    if [[ -x "$HOME/.venvs/jupyter-forward/bin/python" ]]; then
+        PYTHON="$HOME/.venvs/jupyter-forward/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        PYTHON="python3"
+    fi
+
+    local SCRIPT_DIR
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local TUI_SCRIPT=""
+    if [[ -f "$SCRIPT_DIR/cluster_tui.py" ]]; then
+        TUI_SCRIPT="$SCRIPT_DIR/cluster_tui.py"
+    elif [[ -f "$HOME/.local/bin/cluster_tui.py" ]]; then
+        TUI_SCRIPT="$HOME/.local/bin/cluster_tui.py"
+    elif [[ -f "$HOME/Downloads/cluster/cluster_tui.py" ]]; then
+        TUI_SCRIPT="$HOME/Downloads/cluster/cluster_tui.py"
+    fi
+
+    if [[ -n "$PYTHON" && -n "$TUI_SCRIPT" ]] && "$PYTHON" -c "import textual" >/dev/null 2>&1; then
+        exec "$PYTHON" "$TUI_SCRIPT" "$@"
+    else
+        show_capabilities
+    fi
+}
+
 # First run detection
 check_first_run() {
     if [[ ! -f "$FIRST_RUN_MARKER" ]]; then
@@ -668,14 +694,19 @@ check_first_run() {
         echo "Welcome to cluster! Initial setup detected."
         echo ""
         show_capabilities
-        exit 0
+        echo ""
+        read -r -p "Press Enter to start the cluster TUI dashboard..." || true
     fi
 }
 
 # Main Entry Point
 if [[ $# -eq 0 ]]; then
     check_first_run
-    show_capabilities
+    if [[ -t 0 && -t 1 ]]; then
+        launch_tui
+    else
+        show_capabilities
+    fi
     exit 0
 fi
 
@@ -683,6 +714,12 @@ COMMAND="$1"
 shift
 
 case "$COMMAND" in
+    tui|gui|ui|dashboard)
+        launch_tui "$@"
+        ;;
+    cli)
+        show_capabilities
+        ;;
     dev|workspace|session)
         cmd_dev "$@"
         ;;
