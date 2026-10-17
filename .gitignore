@@ -1,0 +1,14 @@
+# Configuration and secrets
+config
+.env
+*.local
+
+# Logs and runtime files
+*.log
+.jupyter_forward/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/

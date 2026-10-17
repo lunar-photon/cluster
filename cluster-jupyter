@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+#
+# cluster-jupyter
+# Seamlessly launch remote JupyterLab on an HPC cluster and open it in your local browser.
+# Handles automatic port forwarding, token authentication, and optional Slurm allocations.
+#
+
+set -euo pipefail
+
+# Default configuration
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cluster-jupyter"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# Load user config file if present
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+# Fallback defaults
+HOST="${CLUSTER_HOST:-${HOST:-}}"
+PORT="${CLUSTER_PORT:-${PORT:-8888}}"
+SLURM_PARTITION="${SLURM_PARTITION:-medium}"
+SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
+SLURM_QOS="${SLURM_QOS:-}"
+SLURM_CPUS="${SLURM_CPUS:-4}"
+SLURM_MEM="${SLURM_MEM:-8G}"
+GPU_PARTITION="${GPU_PARTITION:-gpu}"
+GPU_QOS="${GPU_QOS:-}"
+NOTEBOOK_DIR="${NOTEBOOK_DIR:-}"
+
+# Locate jupyter-forward executable
+if [[ -x "$HOME/.venvs/jupyter-forward/bin/jupyter-forward" ]]; then
+    JUPYTER_FORWARD="$HOME/.venvs/jupyter-forward/bin/jupyter-forward"
+elif command -v jupyter-forward >/dev/null 2>&1; then
+    JUPYTER_FORWARD="$(command -v jupyter-forward)"
+else
+    echo "Error: jupyter-forward is not installed." >&2
+    echo "Install it via: pip install jupyter-forward (or run install.sh)" >&2
+    exit 1
+fi
+
+usage() {
+    cat << 'EOF'
+Usage: cluster-jupyter [OPTIONS]
+
+Options:
+  -H, --host HOST        Cluster SSH host or ~/.ssh/config alias
+  -s, --slurm            Launch inside a Slurm CPU allocation
+  -g, --gpu              Launch inside a Slurm GPU allocation
+  -A, --account ACCT     Slurm project/account name
+  -q, --qos QOS          Slurm Quality of Service (QOS)
+  -p, --port PORT        Local port to forward to (default: 8888, auto-increments if busy)
+  -d, --dir DIR          Starting directory for Jupyter notebooks on remote host
+  -c, --custom "CMD"     Custom launch command (overrides automatic srun flags)
+  -h, --help             Show this help message and exit
+
+Configuration:
+  Settings can be saved in ~/.config/cluster-jupyter/config to avoid repeating flags.
+  Example:
+    HOST="cluster.university.edu"
+    SLURM_ACCOUNT="myaccount"
+    SLURM_QOS="standard_qos"
+
+Examples:
+  cluster-jupyter                               # Head node launch using saved host
+  cluster-jupyter -H mycluster                  # Head node launch specifying host
+  cluster-jupyter --slurm                       # Compute node launch
+  cluster-jupyter --gpu                         # GPU node launch
+  cluster-jupyter -d ~/projects/analysis        # Start in specific folder
+EOF
+    exit 0
+}
+
+LAUNCH_MODE="head"
+CUSTOM_CMD=""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -H|--host)
+            HOST="$2"
+            shift 2
+            ;;
+        -s|--slurm)
+            LAUNCH_MODE="slurm"
+            shift
+            ;;
+        -g|--gpu)
+            LAUNCH_MODE="gpu"
+            shift
+            ;;
+        -A|--account)
+            SLURM_ACCOUNT="$2"
+            shift 2
+            ;;
+        -q|--qos)
+            SLURM_QOS="$2"
+            shift 2
+            ;;
+        -p|--port)
+            PORT="$2"
+            shift 2
+            ;;
+        -d|--dir|--notebook-dir)
+            NOTEBOOK_DIR="$2"
+            shift 2
+            ;;
+        -c|--custom)
+            CUSTOM_CMD="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$HOST" ]]; then
+    echo "Error: No cluster host specified." >&2
+    echo "Specify with -H <host>, export CLUSTER_HOST=<host>, or set HOST in $CONFIG_FILE" >&2
+    exit 1
+fi
+
+# Detect free port
+find_free_port() {
+    local p="$1"
+    while nc -z 127.0.0.1 "$p" 2>/dev/null || (ss -tln 2>/dev/null | grep -q ":$p "); do
+        p=$((p + 1))
+    done
+    echo "$p"
+}
+
+ACTIVE_PORT=$(find_free_port "$PORT")
+if [[ "$ACTIVE_PORT" != "$PORT" ]]; then
+    echo "Port $PORT was in use; selected free port $ACTIVE_PORT"
+fi
+
+# Build launch command
+CMD=("$JUPYTER_FORWARD" "$HOST" "--port" "$ACTIVE_PORT")
+
+if [[ -n "$CUSTOM_CMD" ]]; then
+    CMD+=("--launch-command" "$CUSTOM_CMD")
+elif [[ "$LAUNCH_MODE" == "slurm" ]]; then
+    SLURM_CMD="srun -p $SLURM_PARTITION -c $SLURM_CPUS --mem=$SLURM_MEM"
+    [[ -n "$SLURM_ACCOUNT" ]] && SLURM_CMD="$SLURM_CMD -A $SLURM_ACCOUNT"
+    [[ -n "$SLURM_QOS" ]] && SLURM_CMD="$SLURM_CMD --qos=$SLURM_QOS"
+    echo "Allocating Slurm CPU resources: $SLURM_CMD"
+    CMD+=("--launch-command" "$SLURM_CMD")
+elif [[ "$LAUNCH_MODE" == "gpu" ]]; then
+    GPU_CMD="srun -p $GPU_PARTITION --gres=gpu:1 -c $SLURM_CPUS --mem=16G"
+    [[ -n "$SLURM_ACCOUNT" ]] && GPU_CMD="$GPU_CMD -A $SLURM_ACCOUNT"
+    [[ -n "$GPU_QOS" ]] && GPU_CMD="$GPU_CMD --qos=$GPU_QOS"
+    echo "Allocating Slurm GPU resources: $GPU_CMD"
+    CMD+=("--launch-command" "$GPU_CMD")
+fi
+
+if [[ -n "$NOTEBOOK_DIR" ]]; then
+    CMD+=("--notebook-dir" "$NOTEBOOK_DIR")
+fi
+
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+echo "Connecting to $HOST and launching JupyterLab on port $ACTIVE_PORT..."
+exec "${CMD[@]}"
