@@ -373,7 +373,7 @@ cmd_jupyter() {
         exit 1
     fi
 
-    local LAUNCH_MODE="head"
+    local LAUNCH_MODE="slurm"
     local CUSTOM_CMD=""
     local J_PORT="$PORT"
     local J_DIR="$NOTEBOOK_DIR"
@@ -381,6 +381,10 @@ cmd_jupyter() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --head|--login)
+                LAUNCH_MODE="head"
+                shift
+                ;;
             -s|--slurm)
                 LAUNCH_MODE="slurm"
                 shift
