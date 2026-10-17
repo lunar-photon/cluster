@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -151,7 +153,8 @@ func (e *Env) Jupyter(o JupyterOpts) error {
 		sess.HeadPID = info.PID
 	}
 	_ = e.Store.Add(sess)
-	return e.serveJupyter(ctx, which, sess, o.Browse)
+	stop()
+	return e.serveJupyter(sess, o.Browse)
 }
 
 // waitJupyterInfo waits for the server to publish its host and port,
@@ -256,9 +259,61 @@ func openBrowser(url string) {
 	}
 }
 
-// serveJupyter runs the tunnel, restarting it after network loss, until
-// ctx is cancelled (Ctrl+C / terminal closed) or the server goes away.
-func (e *Env) serveJupyter(ctx context.Context, which func() os.Signal, sess session.Session, browse bool) error {
+// kernelProbe counts running kernels via the Jupyter API, from the login
+// node. The token arrives on stdin so it never appears in argv, and proxy
+// settings are ignored because the server is on the cluster network.
+const kernelProbe = `import json, sys, urllib.request
+host, port = sys.argv[1], sys.argv[2]
+token = sys.stdin.readline().strip()
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+req = urllib.request.Request("http://%s:%s/api/kernels" % (host, port), headers={"Authorization": "token " + token})
+print(len(json.load(opener.open(req, timeout=10))))
+`
+
+func (e *Env) kernelCount(sess session.Session) (int, error) {
+	ctx, cancel := timeout(30 * time.Second)
+	defer cancel()
+	out, err := e.R.Output(ctx, remote.Join("python3", "-c", kernelProbe, sess.Node, strconv.Itoa(sess.RemotePort)),
+		strings.NewReader(sess.Token+"\n"))
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(out))
+}
+
+// keepJupyter decides whether a signal should leave Jupyter running.
+// Ctrl+C stops it, after asking if kernels (with in-memory state) are open.
+// A closed terminal only stops it when no kernels are open.
+func (e *Env) keepJupyter(sess session.Session, sig os.Signal) bool {
+	n, err := e.kernelCount(sess)
+	if sig == os.Interrupt {
+		if err == nil && n == 0 {
+			return false
+		}
+		what := fmt.Sprintf("%d kernel(s) are running", n)
+		if err != nil {
+			what = "Couldn't check for running kernels"
+		}
+		e.printf("\n%s. Stopping Jupyter loses their variables (saved notebooks are kept). Stop anyway? [y/N] ", what)
+		line, _ := bufio.NewReader(e.In).ReadString('\n')
+		return !strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "y")
+	}
+	switch {
+	case err != nil:
+		e.notify(fmt.Sprintf("Terminal closed; couldn't check Jupyter %s (%v), so it was kept. `cluster attach %s` reopens it, `cluster stop %s` ends it.",
+			sess.JobID, err, sess.JobID, sess.JobID))
+		return true
+	case n > 0:
+		e.notify(fmt.Sprintf("Terminal closed with %d Jupyter kernel(s) running, so Jupyter %s was kept. `cluster attach %s` reopens it, `cluster stop %s` ends it.",
+			n, sess.JobID, sess.JobID, sess.JobID))
+		return true
+	}
+	return false
+}
+
+// serveJupyter runs the tunnel, restarting it after network loss, until the
+// user stops Jupyter, the terminal closes, or the server goes away.
+func (e *Env) serveJupyter(sess session.Session, browse bool) error {
 	base := e.Cfg.Jupyter.Port
 	if sess.LocalPort != 0 {
 		base = sess.LocalPort
@@ -272,13 +327,19 @@ func (e *Env) serveJupyter(ctx context.Context, which func() os.Signal, sess ses
 		base = lp
 		url := fmt.Sprintf("http://127.0.0.1:%d", lp)
 
+		ctx, which, stop := interrupts()
 		tunnel := e.R.Tunnel(lp, sess.Node, sess.RemotePort)
 		tunnel.Stdin, tunnel.Stdout, tunnel.Stderr = os.Stdin, os.Stdout, os.Stderr
 		if err := tunnel.Start(); err != nil {
+			stop()
 			return err
 		}
 		done := make(chan error, 1)
 		go func() { done <- tunnel.Wait() }()
+		killTunnel := func() {
+			_ = tunnel.Process.Kill()
+			<-done
+		}
 
 		sess.LocalPort, sess.TunnelPID = lp, tunnel.Process.Pid
 		sess.URL = url + "/lab?token=" + sess.Token
@@ -290,7 +351,7 @@ func (e *Env) serveJupyter(ctx context.Context, which func() os.Signal, sess ses
 		if ctx.Err() == nil {
 			if first {
 				e.printf("\nJupyterLab: %s\n", sess.URL)
-				e.printf("Ctrl+C or closing this terminal stops Jupyter and releases the node.\n")
+				e.printf("Ctrl+C stops Jupyter. Closing this terminal keeps it running while kernels are open.\n")
 				if browse {
 					openBrowser(sess.URL)
 				}
@@ -300,20 +361,24 @@ func (e *Env) serveJupyter(ctx context.Context, which func() os.Signal, sess ses
 		}
 		first = false
 
+		// Wait for a signal, the tunnel dying, or the job ending.
+		const (
+			gotSignal = iota
+			tunnelDied
+			jobEnded
+		)
+		outcome := -1
 		alive := time.NewTicker(time.Minute)
-	wait:
-		for {
+		for outcome < 0 {
 			select {
 			case <-ctx.Done():
-				alive.Stop()
-				_ = tunnel.Process.Kill()
-				<-done
-				e.printf("\nStopping Jupyter (%v).\n", which())
-				sess.TunnelPID = 0
-				return e.Release(sess)
+				outcome = gotSignal
 			case <-done:
-				alive.Stop()
-				break wait
+				done <- nil // let killTunnel's receive succeed later
+				outcome = tunnelDied
+				if ctx.Err() != nil {
+					outcome = gotSignal // Ctrl+C reaches ssh too
+				}
 			case <-alive.C:
 				if !sess.IsSlurm() {
 					continue
@@ -322,30 +387,55 @@ func (e *Env) serveJupyter(ctx context.Context, which func() os.Signal, sess ses
 				_, ok, err := e.Slurm.Alive(c, sess.JobID)
 				cancel()
 				if err == nil && !ok {
-					alive.Stop()
-					_ = tunnel.Process.Kill()
-					<-done
-					e.printf("Jupyter job %s has ended (time limit?).\n", sess.JobID)
-					sess.TunnelPID = 0
-					return e.Release(sess)
+					outcome = jobEnded
 				}
 			}
 		}
+		alive.Stop()
+		killTunnel()
+		sess.TunnelPID = 0
+		_ = e.Store.Add(sess)
 
-		// Tunnel exited on its own: network loss or the server went away.
-		e.printf("\nTunnel lost; reconnecting (Jupyter keeps running on the cluster)...\n")
-		if err := e.Reconnect(ctx); err != nil {
-			e.printf("Stopping Jupyter (%v).\n", which())
-			sess.TunnelPID = 0
+		switch outcome {
+		case jobEnded:
+			stop()
+			e.printf("Jupyter job %s has ended (time limit?).\n", sess.JobID)
 			return e.Release(sess)
+		case gotSignal:
+			sig := which()
+			stop()
+			if !e.keepJupyter(sess, sig) {
+				e.printf("Stopping Jupyter.\n")
+				return e.Release(sess)
+			}
+			if sig != os.Interrupt {
+				return nil // terminal closed; Jupyter stays up
+			}
+			e.printf("Jupyter keeps running.\n")
+			continue
+		}
+		stop()
+
+		// The tunnel died on its own: network loss.
+		e.printf("\nTunnel lost; reconnecting (Jupyter keeps running on the cluster)...\n")
+		rctx, rwhich, rstop := interrupts()
+		err := e.Reconnect(rctx)
+		var sig os.Signal
+		if err != nil {
+			sig = rwhich()
+		}
+		rstop()
+		if err != nil {
+			e.printf("Stopped reconnecting (%v). Jupyter %s keeps running on the cluster:\n"+
+				"  cluster attach %s   # reopen it\n  cluster stop %s     # end it\n", sig, sess.JobID, sess.JobID, sess.JobID)
+			return nil
 		}
 		if sess.IsSlurm() {
-			c, cancel := context.WithTimeout(ctx, 20*time.Second)
+			c, cancel := timeout(20 * time.Second)
 			_, ok, err := e.Slurm.Alive(c, sess.JobID)
 			cancel()
 			if err == nil && !ok {
 				e.printf("Jupyter job %s ended while disconnected.\n", sess.JobID)
-				sess.TunnelPID = 0
 				return e.Release(sess)
 			}
 		}

@@ -155,6 +155,7 @@ Run with no arguments in a terminal to open the dashboard.`,
 		execCmd(g),
 		configCmd(g),
 		initCmd(g),
+		setupCmd(g),
 		&cobra.Command{
 			Use:   "connect",
 			Short: "Open the shared ssh connection (prompts for password/2FA if needed)",

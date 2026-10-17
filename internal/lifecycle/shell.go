@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,8 +17,9 @@ import (
 )
 
 // exitDetached is the status the attach wrapper returns when the user
-// detached from tmux and the session is still alive.
-const exitDetached = 100
+// detached from tmux and the session is still alive. It is chosen to be an
+// unlikely shell exit status.
+const exitDetached = 197
 
 type ShellOpts struct {
 	Req     slurm.Request
@@ -34,15 +36,31 @@ type ShellOpts struct {
 	Overlap bool
 }
 
+// findTmux sets $T to a working tmux: one on PATH, or the copy that
+// `cluster setup` builds into ~/.local/bin.
+const findTmux = `T=$(command -v tmux 2>/dev/null || true); ` +
+	`if [ -z "$T" ] && [ -x "$HOME/.local/bin/tmux" ]; then T="$HOME/.local/bin/tmux"; fi; ` +
+	`if [ -n "$T" ] && ! "$T" -V >/dev/null 2>&1; then T=; fi; `
+
 // holdScript is the batch job that holds the allocation. With persist, it
 // also starts the tmux server inside the batch step, so the shell outlives
 // any one srun attach (Slurm kills a step's processes when the step ends).
+// Users without their own tmux config get mouse scrolling and a status bar
+// that says how to detach.
 func holdScript(persist bool) string {
 	s := "#!/bin/bash\n# Holds an interactive allocation for `cluster shell` / `cluster dev`.\n"
 	if persist {
-		s += "if command -v tmux >/dev/null 2>&1; then\n" +
-			"  tmux -L \"cluster-$SLURM_JOB_ID\" new-session -d -s main\n" +
-			"fi\n"
+		s += findTmux + "\n" +
+			`if [ -n "$T" ]; then
+  S="cluster-$SLURM_JOB_ID"
+  "$T" -L "$S" new-session -d -s main
+  if [ ! -e "$HOME/.tmux.conf" ] && [ ! -e "${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf" ]; then
+    "$T" -L "$S" set -g mouse on \; set -g history-limit 50000 \; \
+      set -g status-left " job $SLURM_JOB_ID " \; set -g status-left-length 24 \; \
+      set -g status-right " Ctrl+b d: detach (job keeps running) "
+  fi
+fi
+`
 	}
 	return s + "exec sleep infinity\n"
 }
@@ -52,10 +70,11 @@ func attachCommand(jobID string, persist, overlap bool) string {
 	inner := "exec bash -l"
 	if persist {
 		sock := remote.Quote("cluster-" + jobID)
-		inner = fmt.Sprintf("if command -v tmux >/dev/null 2>&1 && tmux -L %[1]s has-session -t main 2>/dev/null; then "+
-			"tmux -L %[1]s attach -t main; "+
-			"if tmux -L %[1]s has-session -t main 2>/dev/null; then exit %[2]d; fi; exit 0; "+
-			"else exec bash -l; fi", sock, exitDetached)
+		inner = findTmux + fmt.Sprintf(`if [ -n "$T" ] && "$T" -L %[1]s has-session -t main 2>/dev/null; then `+
+			`"$T" -L %[1]s attach -t main; `+
+			`if "$T" -L %[1]s has-session -t main 2>/dev/null; then exit %[2]d; fi; exit 0; `+
+			`else echo "[cluster] tmux is not available on this node, so this shell ends if the connection drops. Run 'cluster setup' to install it." >&2; `+
+			`exec bash -l; fi`, sock, exitDetached)
 	}
 	argv := []string{"srun", "--jobid=" + jobID}
 	if overlap {
@@ -63,6 +82,54 @@ func attachCommand(jobID string, persist, overlap bool) string {
 	}
 	argv = append(argv, "--pty", "bash", "-c", inner)
 	return remote.Join(argv...)
+}
+
+// busyCommand lists what each tmux pane in the job is running.
+func busyCommand(jobID string, overlap bool) string {
+	inner := findTmux + fmt.Sprintf(`[ -n "$T" ] && "$T" -L %s list-panes -a -F '#{pane_current_command}' 2>/dev/null; true`,
+		remote.Quote("cluster-"+jobID))
+	argv := []string{"srun", "--jobid=" + jobID}
+	if overlap {
+		argv = append(argv, "--overlap")
+	}
+	return remote.Join(append(argv, "bash", "-c", inner)...)
+}
+
+var shells = map[string]bool{"bash": true, "zsh": true, "sh": true, "fish": true, "tcsh": true, "csh": true, "ksh": true, "dash": true}
+
+// runningPrograms reports what is running in the job's tmux panes, other
+// than idle shells. Without tmux the list is empty: the shell died with the
+// connection, so there is nothing left to keep.
+func (e *Env) runningPrograms(jobID string, overlap bool) ([]string, error) {
+	ctx, cancel := timeout(30 * time.Second)
+	defer cancel()
+	out, err := e.R.Output(ctx, busyCommand(jobID, overlap), nil)
+	if err != nil {
+		return nil, err
+	}
+	var busy []string
+	for _, cmd := range strings.Fields(out) {
+		if !shells[strings.TrimPrefix(cmd, "-")] {
+			busy = append(busy, cmd)
+		}
+	}
+	return busy, nil
+}
+
+// terminalClosed decides what happens to a session whose terminal went away:
+// release it if nothing is running in it, otherwise keep it and say so.
+func (e *Env) terminalClosed(sess session.Session, overlap bool) error {
+	busy, err := e.runningPrograms(sess.JobID, overlap)
+	switch {
+	case err != nil:
+		e.notify(fmt.Sprintf("Terminal closed; couldn't check job %s (%v), so it was kept. `cluster stop %s` releases it.", sess.JobID, err, sess.JobID))
+		return nil
+	case len(busy) > 0:
+		e.notify(fmt.Sprintf("Terminal closed while %s was running, so job %s was kept. `cluster attach %s` to return, `cluster stop %s` to release.",
+			strings.Join(busy, ", "), sess.JobID, sess.JobID, sess.JobID))
+		return nil
+	}
+	return e.Release(sess)
 }
 
 // StartShell allocates a node, optionally mounts storage, and attaches.
@@ -139,9 +206,7 @@ func (e *Env) Attach(jobID string, persist, overlap bool) error {
 		if sess.Node == "" {
 			return fmt.Errorf("Jupyter session %s never finished starting; release it with `cluster stop %s`", jobID, jobID)
 		}
-		ctx, which, stop := interrupts()
-		defer stop()
-		return e.serveJupyter(ctx, which, sess, true)
+		return e.serveJupyter(sess, true)
 	}
 	ctx, cancel := timeout(30 * time.Second)
 	_, alive, err := e.Slurm.Alive(ctx, jobID)
@@ -202,11 +267,12 @@ func (e *Env) waitRunning(id string) error {
 // attachLoop keeps the terminal attached to the job until the user ends the
 // session, reconnecting through network loss.
 func (e *Env) attachLoop(sess session.Session, persist, overlap bool) error {
-	e.printf("Connected to job %s. `exit` or closing this terminal releases the node", sess.JobID)
 	if persist {
-		e.printf("; detach with tmux (Ctrl+b d) to leave it running")
+		e.printf("Connected to job %s. `exit` releases the node; Ctrl+b d detaches and leaves it running.\n"+
+			"Closing the terminal releases it only if nothing is running.\n", sess.JobID)
+	} else {
+		e.printf("Connected to job %s. `exit` or closing this terminal releases the node.\n", sess.JobID)
 	}
-	e.printf(".\n")
 
 	// SIGINT is not handled here: while ssh -t runs the terminal is in raw
 	// mode, so Ctrl+C goes to the remote shell. SIGHUP/SIGTERM mean the
@@ -231,7 +297,7 @@ func (e *Env) attachLoop(sess session.Session, persist, overlap bool) error {
 		// the signal a moment to arrive before deciding what happened.
 		select {
 		case <-hup:
-			return e.Release(sess)
+			return e.terminalClosed(sess, overlap)
 		case <-time.After(200 * time.Millisecond):
 		}
 

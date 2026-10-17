@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/lunar-photon/cluster/internal/config"
+	"github.com/lunar-photon/cluster/internal/lifecycle"
 	"github.com/lunar-photon/cluster/internal/remote"
 )
 
@@ -103,7 +104,11 @@ func initCmd(g *globals) *cobra.Command {
 			if err := cfg.Save(); err != nil {
 				return err
 			}
-			fmt.Printf("\nSaved %s. Try `cluster shell` or just `cluster`.\n", cfg.Path)
+			fmt.Printf("\nSaved %s.\n\n", cfg.Path)
+			if err := runSetup(lifecycle.New(cfg, r), false, false); err != nil {
+				return err
+			}
+			fmt.Println("\nReady. Try `cluster shell`, or just `cluster` for the dashboard.")
 			return nil
 		},
 	}

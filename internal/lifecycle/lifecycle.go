@@ -19,7 +19,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,6 +41,9 @@ type Env struct {
 	Slurm *slurm.Client
 	Store *session.Store
 	Out   io.Writer
+	In    io.Reader
+	// NoDesktopNotify disables desktop notifications (tests).
+	NoDesktopNotify bool
 }
 
 func New(cfg config.Config, r *remote.Client) *Env {
@@ -45,10 +53,38 @@ func New(cfg config.Config, r *remote.Client) *Env {
 		Slurm: slurm.New(r),
 		Store: session.DefaultStore(),
 		Out:   os.Stderr,
+		In:    os.Stdin,
 	}
 }
 
 func (e *Env) printf(format string, a ...any) { fmt.Fprintf(e.Out, format, a...) }
+
+// notify reports something the user may not see in the terminal (because it
+// was just closed): a desktop notification when possible, the terminal, and
+// a line in the event log.
+func (e *Env) notify(msg string) {
+	e.printf("%s\n", msg)
+	_ = os.MkdirAll(session.Dir(), 0o700)
+	if f, err := os.OpenFile(filepath.Join(session.Dir(), "events.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+		fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.RFC3339), msg)
+		f.Close()
+	}
+	if e.NoDesktopNotify {
+		return
+	}
+	var cmd *exec.Cmd
+	switch {
+	case runtime.GOOS == "darwin":
+		cmd = exec.Command("osascript", "-e", "display notification "+strconv.Quote(msg)+` with title "cluster"`)
+	default:
+		if _, err := exec.LookPath("notify-send"); err == nil {
+			cmd = exec.Command("notify-send", "cluster", msg)
+		}
+	}
+	if cmd != nil {
+		_ = cmd.Run()
+	}
+}
 
 // timeout returns a context for one short remote operation.
 func timeout(d time.Duration) (context.Context, context.CancelFunc) {
@@ -70,10 +106,13 @@ func interrupts() (context.Context, func() os.Signal, context.CancelFunc) {
 		case <-done:
 		}
 	}()
+	var once sync.Once
 	stop := func() {
-		signal.Stop(ch)
-		close(done)
-		cancel()
+		once.Do(func() {
+			signal.Stop(ch)
+			close(done)
+			cancel()
+		})
 	}
 	which := func() os.Signal { <-ctx.Done(); return got }
 	return ctx, which, stop

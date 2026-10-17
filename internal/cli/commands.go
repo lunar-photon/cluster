@@ -40,11 +40,12 @@ func shellCmd(g *globals, dev bool) *cobra.Command {
 		Short:   "Allocate a compute node and open a shell on it",
 		Long: `Allocate a compute node and open a shell on it.
 
-The allocation is released when you type exit or close the terminal. If the
-network drops, the job keeps running and cluster reconnects by itself; when
-tmux is available on the cluster you come back to the same shell, with
-running programs untouched. Detach on purpose with Ctrl+b d, and come back
-later with cluster attach.`,
+The allocation is released when you type exit. Closing the terminal releases
+it too, unless a program is still running in the shell; then the job is kept
+and you are notified. If the network drops, the job keeps running and cluster
+reconnects by itself; with tmux on the cluster (see cluster setup) you come
+back to the same shell, with running programs untouched. Detach on purpose
+with Ctrl+b d, and come back later with cluster attach.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			e, err := g.env()

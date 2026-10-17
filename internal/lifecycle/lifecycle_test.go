@@ -7,7 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/lunar-photon/cluster/internal/config"
 	"github.com/lunar-photon/cluster/internal/remote"
@@ -60,8 +62,10 @@ for id in "$@"; do rm -f "$FAKE/job_$id"; echo "$id" >> "$FAKE/cancelled"; done
 
 // srun pops its exit status from $FAKE/srun_codes, one per attach.
 const fakeSrun = `#!/usr/bin/env bash
+if [[ "$*" == *list-panes* ]]; then cat "$FAKE/panes" 2>/dev/null; exit 0; fi
 echo "$*" >> "$FAKE/srun_calls"
 code=$(head -n1 "$FAKE/srun_codes"); sed -i 1d "$FAKE/srun_codes"
+if [[ "$code" == hup ]]; then touch "$FAKE/attached"; sleep 1; exit 255; fi
 exit "${code:-0}"
 `
 
@@ -113,6 +117,7 @@ func newFake(t *testing.T, srunCodes ...string) *fake {
 
 	t.Setenv("HOME", filepath.Join(dir, "home"))
 	os.MkdirAll(filepath.Join(dir, "home"), 0o755)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state"))
 	t.Setenv("FAKE", dir)
 	t.Setenv("FAKE_PORT", port)
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
@@ -128,6 +133,9 @@ func newFake(t *testing.T, srunCodes ...string) *fake {
 		Slurm: slurm.New(r),
 		Store: &session.Store{Path: filepath.Join(dir, "sessions.json")},
 		Out:   out,
+		In:    strings.NewReader(""),
+
+		NoDesktopNotify: true,
 	}
 	return &fake{dir: dir, env: e, out: out}
 }
@@ -160,7 +168,7 @@ func TestShellExitReleasesJob(t *testing.T) {
 	if !strings.Contains(f.read("sbatch_args"), "--job-name=cluster:shell") {
 		t.Errorf("sbatch args: %s", f.read("sbatch_args"))
 	}
-	if !strings.Contains(f.read("script"), "tmux -L \"cluster-$SLURM_JOB_ID\" new-session -d") {
+	if !strings.Contains(f.read("script"), `"$T" -L "$S" new-session -d -s main`) {
 		t.Errorf("hold script should start tmux:\n%s", f.read("script"))
 	}
 	if calls := f.read("srun_calls"); !strings.Contains(calls, "--jobid=1001 --overlap --pty") {
@@ -196,7 +204,7 @@ func TestConnectionLossReattaches(t *testing.T) {
 }
 
 func TestDetachKeepsJob(t *testing.T) {
-	f := newFake(t, "100")
+	f := newFake(t, "197")
 	if err := f.env.StartShell(shellOpts()); err != nil {
 		t.Fatalf("%v\n%s", err, f.out)
 	}
@@ -276,5 +284,57 @@ func TestJupyterScriptKeepsTokenOutOfArgv(t *testing.T) {
 	}
 	if !strings.Contains(s, `cd "$HOME"/nb`) {
 		t.Errorf("~/ dir should expand remotely:\n%s", s)
+	}
+}
+
+// Closing the terminal while a program runs in tmux keeps the job.
+func TestTerminalCloseKeepsBusyJob(t *testing.T) {
+	f := newFake(t, "hup")
+	os.WriteFile(filepath.Join(f.dir, "panes"), []byte("bash\npython3\n"), 0o644)
+	go func() {
+		for i := 0; i < 100; i++ {
+			if _, err := os.Stat(filepath.Join(f.dir, "attached")); err == nil {
+				syscall.Kill(os.Getpid(), syscall.SIGHUP)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	if err := f.env.StartShell(shellOpts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out)
+	}
+	if f.read("cancelled") != "" {
+		t.Errorf("busy job must not be cancelled:\n%s", f.out)
+	}
+	if !strings.Contains(f.out.String(), "python3 was running, so job 1001 was kept") {
+		t.Errorf("missing keep notice:\n%s", f.out)
+	}
+	if len(f.sessions(t)) != 1 {
+		t.Error("kept session should stay tracked")
+	}
+	log, _ := os.ReadFile(filepath.Join(session.Dir(), "events.log"))
+	if !strings.Contains(string(log), "job 1001 was kept") {
+		t.Errorf("event log: %q", log)
+	}
+}
+
+// Closing the terminal on an idle shell releases the node.
+func TestTerminalCloseReleasesIdleJob(t *testing.T) {
+	f := newFake(t, "hup")
+	os.WriteFile(filepath.Join(f.dir, "panes"), []byte("bash\n"), 0o644)
+	go func() {
+		for i := 0; i < 100; i++ {
+			if _, err := os.Stat(filepath.Join(f.dir, "attached")); err == nil {
+				syscall.Kill(os.Getpid(), syscall.SIGHUP)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	if err := f.env.StartShell(shellOpts()); err != nil {
+		t.Fatalf("%v\n%s", err, f.out)
+	}
+	if strings.TrimSpace(f.read("cancelled")) != "1001" {
+		t.Errorf("idle job should be released:\n%s", f.out)
 	}
 }
