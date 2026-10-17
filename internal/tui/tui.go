@@ -603,47 +603,142 @@ func (m model) viewActions() string {
 		fmt.Fprintf(&b, "%s%s  %s %s\n", cursor, accentSt.Render(a.key), label+strings.Repeat(" ", max(1, 37-len(a.label))), mutedSt.Render(a.desc))
 	}
 
-	// What the buttons will ask for, and whether it's free right now.
-	b.WriteString("\n" + accentSt.Render("What these request") + mutedSt.Render("  (change in Settings or with flags)") + "\n")
+	// What the buttons will ask for, where those values come from, and
+	// whether the request is free right now.
+	source := "built-in defaults"
+	if m.cfg.Source != "" {
+		source = "your config, " + config.ShortPath(m.cfg.Source)
+	}
+	b.WriteString("\n" + accentSt.Render("What these request") + "\n")
+	b.WriteString(hang(mutedSt.Render("From "+source+" · change in Settings, or per session with -c -m -t -p -q"), "  ", m.width))
 	for _, prof := range []struct{ label, name string }{{"CPU", ""}, {"GPU", "gpu"}} {
 		p, err := m.cfg.Profile(prof.name)
 		if err != nil {
 			fmt.Fprintf(&b, "  %-4s %s\n", prof.label, mutedSt.Render("no GPU profile configured"))
 			continue
 		}
-		fmt.Fprintf(&b, "  %-4s %s\n", prof.label, requestText(p))
-		if s, ok := m.summary(p.Partition); ok {
-			fmt.Fprintf(&b, "       %s\n", m.availabilityHint(s, p))
+		s, known := m.summary(p.Partition)
+		cores := 0
+		if known {
+			cores = nodeCores(s)
+		}
+		b.WriteString(hang(fmt.Sprintf("%-4s ", prof.label)+requestText(p, cores, m.info == nil || m.info.MemTracked), "  ", m.width))
+		const indent = "       "
+		if prof.name != "" {
+			if inherited := inheritedFields(m.cfg, prof.name, m.info == nil || m.info.MemTracked); inherited != "" {
+				b.WriteString(hang(mutedSt.Render(inherited), indent, m.width))
+			}
+		}
+		if known {
+			b.WriteString(hang(m.availabilityHint(s, p), indent, m.width))
 		}
 	}
 	return b.String()
 }
 
-func requestText(p config.Slurm) string {
-	part := p.Partition
-	if part == "" {
-		part = "default partition"
+// hang wraps text to the terminal width with every line indented by
+// prefix, and a further 5 columns on continuation lines.
+func hang(text, prefix string, width int) string {
+	w := max(20, width-len(prefix))
+	lines := strings.Split(lipgloss.NewStyle().Width(w).Render(text), "\n")
+	var b strings.Builder
+	for i, l := range lines {
+		l = strings.TrimRight(l, " ")
+		if i > 0 {
+			l = "     " + strings.TrimLeft(l, " ")
+		}
+		b.WriteString(prefix + l + "\n")
+	}
+	return b.String()
+}
+
+// requestText labels every value, e.g. "partition medium · 4 of 28 cores on
+// one node · 8G memory · 04:00:00 time limit · QOS normal". nodeCores is
+// the partition's cores per node, or 0 when unknown or mixed. Memory is left
+// out when showMem is false (the cluster doesn't track memory per job).
+func requestText(p config.Slurm, nodeCores int, showMem bool) string {
+	part := "default partition"
+	if p.Partition != "" {
+		part = "partition " + p.Partition
 	}
 	parts := []string{part}
 	if p.CPUs > 0 {
-		parts = append(parts, slurm.Plural(p.CPUs, "CPU"))
+		parts = append(parts, coresText(p.CPUs, nodeCores))
 	}
 	if p.GPUs > 0 {
 		parts = append(parts, slurm.Plural(p.GPUs, "GPU"))
 	}
-	mem := p.Mem
-	if mem == "" {
-		mem = "default memory"
+	if showMem {
+		mem := "default memory"
+		if p.Mem != "" {
+			mem = p.Mem + " memory"
+		}
+		parts = append(parts, mem)
 	}
-	tm := p.Time
-	if tm == "" {
-		tm = "partition time limit"
+	tm := "the partition's time limit"
+	if p.Time != "" {
+		tm = p.Time + " time limit"
 	}
-	parts = append(parts, mem, tm)
+	parts = append(parts, tm)
 	if p.QOS != "" {
 		parts = append(parts, "QOS "+p.QOS)
 	}
 	return strings.Join(parts, " · ")
+}
+
+// coresText is "4 of 28 cores on one node", or "4 cores on one node" when
+// the node size is unknown.
+func coresText(cores, nodeCores int) string {
+	if nodeCores > 0 {
+		return fmt.Sprintf("%d of %d cores on one node", cores, nodeCores)
+	}
+	return slurm.Plural(cores, "core") + " on one node"
+}
+
+// nodeCores is the cores per node in a partition when all its nodes match.
+func nodeCores(s slurm.Summary) int {
+	if len(s.Shapes) == 0 {
+		return 0
+	}
+	n := s.Shapes[0].CPUs
+	for _, sh := range s.Shapes[1:] {
+		if sh.CPUs != n {
+			return 0
+		}
+	}
+	return n
+}
+
+// inheritedFields says which values a profile takes from [slurm] rather than
+// setting itself, e.g. "CPUs, memory and time limit come from the CPU settings".
+func inheritedFields(cfg config.Config, profile string, showMem bool) string {
+	own, ok := cfg.Profiles[profile]
+	if !ok {
+		return ""
+	}
+	var names []string
+	if own.CPUs == 0 && cfg.Slurm.CPUs != 0 {
+		names = append(names, "cores")
+	}
+	if own.Mem == "" && cfg.Slurm.Mem != "" && showMem {
+		names = append(names, "memory")
+	}
+	if own.Time == "" && cfg.Slurm.Time != "" {
+		names = append(names, "time limit")
+	}
+	if own.Account == "" && cfg.Slurm.Account != "" {
+		names = append(names, "account")
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	s, verb := names[0], "comes"
+	if len(names) > 1 {
+		s, verb = strings.Join(names[:len(names)-1], ", ")+" and "+names[len(names)-1], "come"
+	} else if s == "cores" {
+		verb = "come"
+	}
+	return strings.ToUpper(s[:1]) + s[1:] + " " + verb + " from the CPU settings"
 }
 
 // availabilityHint says whether a request would start now in partition s.
@@ -652,7 +747,7 @@ func (m model) availabilityHint(s slurm.Summary, p config.Slurm) string {
 		return badSt.Render("you can't use " + s.Name + ": " + s.Why)
 	}
 	a := m.info.AvailableTo(s)
-	text := fmt.Sprintf("%s now: %s free on %s", s.Name, slurm.Plural(s.CPUsFree, "CPU"), slurm.Plural(s.Idle+s.Mixed, "node"))
+	text := fmt.Sprintf("%s now: %s free on %s", s.Name, slurm.Plural(s.CPUsFree, "core"), slurm.Plural(s.Idle+s.Mixed, "node"))
 	if s.GPUsTotal > 0 {
 		text += ", " + slurm.Plural(s.GPUsFree, "GPU") + " free"
 	}

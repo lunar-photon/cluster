@@ -95,6 +95,8 @@ type Config struct {
 	Path string `toml:"-"`
 	// Legacy is true when the values came from the old shell-style file.
 	Legacy bool `toml:"-"`
+	// Source is the file the values were read from; empty for built-in defaults.
+	Source string `toml:"-"`
 }
 
 var DefaultSyncExcludes = []string{
@@ -165,11 +167,13 @@ func Load(path string) (Config, error) {
 			return cfg, fmt.Errorf("%s: %w", path, err)
 		}
 		cfg = overlay(cfg, file)
+		cfg.Source = path
 	case errors.Is(err, os.ErrNotExist):
 		for _, lp := range LegacyPaths() {
 			if legacy, err := os.ReadFile(lp); err == nil {
 				cfg = overlay(cfg, ParseLegacy(string(legacy)))
 				cfg.Legacy = true
+				cfg.Source = lp
 				break
 			}
 		}
@@ -260,6 +264,14 @@ func ExpandHome(p string) string {
 		return home + p[len("$HOME"):]
 	case strings.HasPrefix(p, "${HOME}"):
 		return home + p[len("${HOME}"):]
+	}
+	return p
+}
+
+// ShortPath shows a path with the home directory as ~.
+func ShortPath(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(p, home+"/") {
+		return "~" + p[len(home):]
 	}
 	return p
 }

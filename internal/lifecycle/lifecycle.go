@@ -329,20 +329,25 @@ func (e *Env) GC(cancelUntracked bool) error {
 }
 
 // describeAllocation prints the node's hardware and what the job was given,
-// e.g. "Node: 28 cores (2 sockets × 14), 125 GB RAM · Your job: 4 CPUs, 8G".
+// e.g. "Node: 28 cores (2 sockets × 14), 125 GB RAM · Your job: 4 of 28 cores, 8G memory".
 // It is informational, so lookup failures are ignored.
 func (e *Env) describeAllocation(job slurm.Job) {
 	var parts []string
+	nodeCores := 0
 	if node := job.NodeList; node != "" && !strings.ContainsAny(node, "[,(") {
 		ctx, cancel := timeout(15 * time.Second)
 		n, err := e.Slurm.NodeInfo(ctx, node)
 		cancel()
 		if err == nil {
 			parts = append(parts, "Node: "+n.Shape().String())
+			nodeCores = n.CPUs
 		}
 	}
 	if job.CPUs != "" {
-		mine := "Your job: " + job.CPUs + " CPUs"
+		mine := "Your job: " + job.CPUs + " cores"
+		if nodeCores > 0 {
+			mine = "Your job: " + job.CPUs + " of " + strconv.Itoa(nodeCores) + " cores"
+		}
 		if job.Mem != "" && job.Mem != "0" {
 			mine += ", " + job.Mem + " memory"
 		}
