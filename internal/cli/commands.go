@@ -29,16 +29,26 @@ func (p *persistFlags) register(cmd *cobra.Command) {
 	cmd.Flags().BoolVar(&p.noOverlap, "no-overlap", false, "omit srun --overlap (for Slurm older than 20.11)")
 }
 
-func shellCmd(g *globals, dev bool) *cobra.Command {
+// terminalCmd is "Node terminal", and with --mount "Node terminal + cluster mount".
+func terminalCmd(g *globals) *cobra.Command { return newTerminalCmd(g, false) }
+
+// devCmd keeps the old `cluster dev` working as `cluster terminal --mount`.
+func devCmd(g *globals) *cobra.Command { return newTerminalCmd(g, true) }
+
+func newTerminalCmd(g *globals, alwaysMount bool) *cobra.Command {
 	var sf slurmFlags
 	var pf persistFlags
-	var browse bool
+	var withMount, browse bool
 	var remoteDir string
 	cmd := &cobra.Command{
-		Use:     "shell",
-		Aliases: []string{"sh", "interactive"},
-		Short:   "Allocate a compute node and open a shell on it",
-		Long: `Allocate a compute node and open a shell on it.
+		Use:     "terminal",
+		Aliases: []string{"term", "shell", "sh"},
+		Short:   "Node terminal: a shell on a compute node (--mount adds the cluster mount)",
+		Long: `Node terminal: allocate a compute node and open a shell on it.
+
+Node terminal + cluster mount (--mount): also mount cluster storage at
+mount_point on this machine for as long as the session lasts, so you can edit
+files with local tools while running them on the node.
 
 The allocation is released when you type exit. Closing the terminal releases
 it too, unless a program is still running in the shell; then the job is kept
@@ -59,21 +69,23 @@ with Ctrl+b d, and come back later with cluster attach.`,
 			if remoteDir == "" {
 				remoteDir = e.Cfg.RemoteDir
 			}
+			mountToo := alwaysMount || withMount || browse || cmd.Flags().Changed("dir")
 			return e.StartShell(lifecycle.ShellOpts{
-				Req: req, Profile: profile, Dev: dev, RemoteDir: remoteDir, Browse: browse,
+				Req: req, Profile: profile, Mount: mountToo, RemoteDir: remoteDir, Browse: browse,
 				Persist: !pf.noPersist, Overlap: !pf.noOverlap,
 			})
 		},
 	}
-	if dev {
+	if alwaysMount {
 		cmd.Use = "dev"
-		cmd.Aliases = []string{"workspace", "session"}
-		cmd.Short = "Mount cluster storage and open a compute-node shell; both are cleaned up on exit"
-		cmd.Long = strings.Replace(cmd.Long, "Allocate a compute node and open a shell on it.",
-			"Mount cluster storage locally, then allocate a compute node and open a shell\non it. The mount is removed when the session ends.", 1)
-		cmd.Flags().BoolVarP(&browse, "browse", "b", false, "open the mount in your file manager")
-		cmd.Flags().StringVarP(&remoteDir, "dir", "d", "", "remote directory to mount (default: remote home)")
+		cmd.Aliases = []string{"workspace"}
+		cmd.Short = "Same as `cluster terminal --mount`"
+		cmd.Hidden = true
+	} else {
+		cmd.Flags().BoolVar(&withMount, "mount", false, "also mount cluster storage locally for the session (node terminal + cluster mount)")
 	}
+	cmd.Flags().BoolVarP(&browse, "browse", "b", false, "open the mount in your file manager (implies --mount)")
+	cmd.Flags().StringVarP(&remoteDir, "dir", "d", "", "remote directory to mount (implies --mount; default: remote home)")
 	sf.register(cmd)
 	pf.register(cmd)
 	return cmd
@@ -224,17 +236,20 @@ func gcCmd(g *globals) *cobra.Command {
 
 func jupyterCmd(g *globals) *cobra.Command {
 	var sf slurmFlags
-	var head, noBrowser bool
+	var noBrowser bool
 	var port int
 	var dir string
 	cmd := &cobra.Command{
 		Use:     "jupyter",
 		Aliases: []string{"lab", "jupyterlab"},
-		Short:   "Run JupyterLab on a compute node and open it in your browser",
-		Long: `Run JupyterLab on a compute node (or the login node with --head), tunnel it
-to localhost, and open your browser. If the network drops, Jupyter keeps
-running and the tunnel is restored automatically. Ctrl+C or closing the
-terminal stops Jupyter and releases the node.
+		Short:   "Jupyter session on node: JupyterLab on a compute node, in your browser",
+		Long: `Jupyter session on node: run JupyterLab as a Slurm job on a compute node,
+tunnel it to localhost, and open your browser. It never runs on the login node.
+
+If the network drops, Jupyter keeps running and the tunnel is restored
+automatically. Ctrl+C stops Jupyter and releases the node, asking first if
+kernels are open. Closing the terminal keeps Jupyter running while kernels
+are open; cluster attach reopens it.
 
 Jupyter must be on the remote PATH after [jupyter] setup runs, e.g.
   [jupyter]
@@ -252,24 +267,30 @@ Jupyter must be on the remote PATH after [jupyter] setup runs, e.g.
 			if dir == "" {
 				dir = e.Cfg.Jupyter.Dir
 			}
-			if head {
-				profile = "login-node"
-			}
 			return e.Jupyter(lifecycle.JupyterOpts{
-				Head: head, Req: req, Profile: profile, Dir: dir, Port: port, Browse: !noBrowser,
+				Req: req, Profile: profile, Dir: dir, Port: port, Browse: !noBrowser,
 			})
 		},
 	}
 	sf.register(cmd)
-	cmd.Flags().BoolVar(&head, "head", false, "run on the login node instead of a compute node")
-	cmd.Flags().BoolVar(&head, "login", false, "alias for --head")
 	cmd.Flags().IntVar(&port, "port", 0, "local port (default [jupyter] port, next free one if taken)")
 	cmd.Flags().StringVarP(&dir, "dir", "d", "", "remote notebook directory")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "print the URL without opening a browser")
 	// -s/--slurm from the bash version is now the default behavior.
 	cmd.Flags().BoolP("slurm", "s", false, "run on a compute node (default)")
 	_ = cmd.Flags().MarkHidden("slurm")
-	_ = cmd.Flags().MarkHidden("login")
+	// --head/--login (login-node Jupyter) were removed: no computation runs on
+	// the login node. Keep the flags only to explain that.
+	for _, name := range []string{"head", "login"} {
+		cmd.Flags().Bool(name, false, "")
+		_ = cmd.Flags().MarkHidden(name)
+	}
+	cmd.PreRunE = func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("head") || cmd.Flags().Changed("login") {
+			return fmt.Errorf("JupyterLab no longer runs on the login node; it always runs on a compute node (use -c/-m/-t for a small allocation)")
+		}
+		return nil
+	}
 	return cmd
 }
 
@@ -429,7 +450,7 @@ func statusCmd(g *globals) *cobra.Command {
 	return &cobra.Command{
 		Use:     "status",
 		Aliases: []string{"stat", "queue", "q"},
-		Short:   "Show your Slurm jobs and partition availability",
+		Short:   "Show your jobs, then partitions, free resources and your limits",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			e, err := g.env()
@@ -445,9 +466,12 @@ func statusCmd(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			parts, err := e.Slurm.Partitions(ctx)
+			info, err := e.Slurm.ClusterInfo(ctx)
 			if err != nil {
 				return err
+			}
+			if p, err := e.Cfg.Profile(""); err == nil {
+				info.PreferredQOS = p.QOS
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 			fmt.Fprintln(w, "JOBID\tPARTITION\tNAME\tSTATE\tTIME\tLIMIT\tNODES\tNODELIST(REASON)")
@@ -457,12 +481,10 @@ func statusCmd(g *globals) *cobra.Command {
 			if len(jobs) == 0 {
 				fmt.Fprintln(w, "(no jobs)")
 			}
-			fmt.Fprintln(w)
-			fmt.Fprintln(w, "PARTITION\tAVAIL\tTIMELIMIT\tNODES\tSTATE\tNODELIST")
-			for _, p := range parts {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", p.Name, p.Avail, p.TimeLimit, p.Nodes, p.State, p.NodeList)
-			}
-			return w.Flush()
+			w.Flush()
+			fmt.Println()
+			printInfo(os.Stdout, e.Cfg.Host, info)
+			return nil
 		},
 	}
 }

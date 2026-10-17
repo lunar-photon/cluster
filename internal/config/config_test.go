@@ -40,6 +40,7 @@ MOUNT_POINT="$HOME/Cluster"
 
 func TestProfileMerge(t *testing.T) {
 	c := Defaults()
+	c.Slurm.Partition = "medium"
 	c.Slurm.Account = "lab"
 	c.Slurm.QOS = "cpu_qos"
 	c.Profiles["gpu"] = Slurm{Partition: "gpu", GPUs: 1, QOS: "gpu_qos"}
@@ -75,7 +76,7 @@ func TestLoadPrecedenceAndRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.Legacy || c.Host != "old.example" || c.Slurm.CPUs != 8 || c.Slurm.Mem != "8G" {
+	if !c.Legacy || c.Host != "old.example" || c.Slurm.CPUs != 8 || c.Slurm.Mem != "" || c.Slurm.Partition != "" {
 		t.Fatalf("legacy load: %+v", c)
 	}
 
@@ -117,7 +118,18 @@ cpus = 32
 		t.Error("built-in gpu profile should not leak into a user's [profiles]")
 	}
 	p, err := c.Profile("")
-	if err != nil || p.CPUs != 32 || p.Partition != "medium" {
+	if err != nil || p.CPUs != 32 || p.Partition != "" {
 		t.Errorf("big profile: %+v %v", p, err)
+	}
+}
+
+func TestDefaultsNameNoSiteSpecifics(t *testing.T) {
+	c := Defaults()
+	if c.Host != "" || c.Slurm.Partition != "" || c.Slurm.Account != "" || c.Slurm.QOS != "" ||
+		c.Slurm.Mem != "" || c.Slurm.Time != "" || c.Profiles["gpu"].Partition != "" {
+		t.Errorf("defaults must not assume anything about a site: %+v %+v", c.Slurm, c.Profiles)
+	}
+	if ParseLegacy("GPU_QOS=x\n").Profiles["gpu"].Partition != "" {
+		t.Error("legacy import must not invent a GPU partition name")
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -17,9 +16,9 @@ import (
 type Kind string
 
 const (
-	Shell   Kind = "shell"
-	Dev     Kind = "dev"
-	Jupyter Kind = "jupyter"
+	Terminal      Kind = "terminal"       // node terminal
+	TerminalMount Kind = "terminal+mount" // node terminal + cluster mount
+	Jupyter       Kind = "jupyter"
 )
 
 type Session struct {
@@ -30,11 +29,9 @@ type Session struct {
 	Created time.Time `json:"created"`
 	// Mount is the local mount point this session mounted, if any.
 	Mount string `json:"mount,omitempty"`
-	// Node and RemotePort locate a Jupyter server; HeadPID is its process on
-	// the login node when it runs outside Slurm.
+	// Node and RemotePort locate a Jupyter server on its compute node.
 	Node       string `json:"node,omitempty"`
 	RemotePort int    `json:"remote_port,omitempty"`
-	HeadPID    int    `json:"head_pid,omitempty"`
 	Token      string `json:"token,omitempty"`
 	// LocalPort and URL describe the local end of a Jupyter tunnel.
 	LocalPort int    `json:"local_port,omitempty"`
@@ -100,9 +97,6 @@ func (s *Store) Add(sess Session) error {
 		return append(Remove(l, sess.JobID), sess)
 	})
 }
-
-// IsSlurm is false for sessions that are not Slurm jobs (head-node Jupyter).
-func (x Session) IsSlurm() bool { return !strings.HasPrefix(x.JobID, "head-") }
 
 func (s *Store) Delete(jobID string) error {
 	return s.Update(func(l []Session) []Session { return Remove(l, jobID) })

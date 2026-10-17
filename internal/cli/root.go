@@ -63,7 +63,7 @@ func (g *globals) env() (*lifecycle.Env, error) {
 	return e, nil
 }
 
-// slurmFlags are the allocation flags shared by shell, dev, exec and jupyter.
+// slurmFlags are the allocation flags shared by terminal, exec and jupyter.
 type slurmFlags struct {
 	profile   string
 	gpu       bool
@@ -102,6 +102,9 @@ func (f *slurmFlags) request(cfg config.Config, fallbackProfile string) (slurm.R
 	}
 	base, err := cfg.Profile(name)
 	if err != nil {
+		if f.gpu {
+			return slurm.Request{}, "", fmt.Errorf("no GPU profile in your config; run `cluster init` (it finds the GPU partitions) or add [profiles.gpu] with `cluster config`")
+		}
 		return slurm.Request{}, "", err
 	}
 	if name == "" {
@@ -141,8 +144,8 @@ Run with no arguments in a terminal to open the dashboard.`,
 	pf.BoolVarP(&g.dryRun, "dry-run", "n", false, "print remote and local commands instead of running them")
 
 	root.AddCommand(
-		shellCmd(g, false),
-		shellCmd(g, true),
+		terminalCmd(g),
+		devCmd(g),
 		attachCmd(g),
 		psCmd(g),
 		stopCmd(g),
@@ -156,6 +159,7 @@ Run with no arguments in a terminal to open the dashboard.`,
 		configCmd(g),
 		initCmd(g),
 		setupCmd(g),
+		infoCmd(g),
 		&cobra.Command{
 			Use:   "connect",
 			Short: "Open the shared ssh connection (prompts for password/2FA if needed)",

@@ -15,7 +15,6 @@ package lifecycle
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,6 +23,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -158,13 +158,7 @@ func (e *Env) Release(sess session.Session) error {
 		}
 	}
 
-	var jobErr error
-	switch {
-	case sess.IsSlurm():
-		jobErr = e.cancelAndConfirm(ctx, sess.JobID)
-	case sess.HeadPID > 0:
-		_, jobErr = e.R.Output(ctx, fmt.Sprintf("kill %d 2>/dev/null; true", sess.HeadPID), nil)
-	}
+	jobErr := e.cancelAndConfirm(ctx, sess.JobID)
 	if jobErr == nil && len(sess.RemoteFiles) > 0 {
 		_, _ = e.R.Run(ctx, append([]string{"rm", "-f", "--"}, sess.RemoteFiles...)...)
 	}
@@ -180,7 +174,7 @@ func (e *Env) Release(sess session.Session) error {
 	}
 
 	if jobErr != nil {
-		e.printf("Could not release %s: %v\n", describe(sess), jobErr)
+		e.printf("Could not release job %s: %v\n", sess.JobID, jobErr)
 		e.printf("It stays tracked; run `cluster gc` once the cluster is reachable.\n")
 		// Keep the record but drop the mount reference we already handled.
 		if mountErr == nil && sess.Mount != "" {
@@ -191,13 +185,6 @@ func (e *Env) Release(sess session.Session) error {
 	}
 	_ = e.Store.Delete(sess.JobID)
 	return mountErr
-}
-
-func describe(s session.Session) string {
-	if s.IsSlurm() {
-		return "job " + s.JobID
-	}
-	return "login-node Jupyter (pid " + fmt.Sprint(s.HeadPID) + ")"
 }
 
 // cancelAndConfirm scancels a job and waits until Slurm no longer reports it
@@ -253,7 +240,7 @@ type Status struct {
 }
 
 // Sessions returns tracked sessions with their live state, using one squeue
-// call for all Slurm jobs.
+// call for all of them.
 func (e *Env) Sessions(ctx context.Context) ([]Status, error) {
 	list, err := e.Store.List()
 	if err != nil {
@@ -261,9 +248,7 @@ func (e *Env) Sessions(ctx context.Context) ([]Status, error) {
 	}
 	var ids []string
 	for _, s := range list {
-		if s.IsSlurm() {
-			ids = append(ids, s.JobID)
-		}
+		ids = append(ids, s.JobID)
 	}
 	var jobs []slurm.Job
 	var qerr error
@@ -278,12 +263,6 @@ func (e *Env) Sessions(ctx context.Context) ([]Status, error) {
 	for _, s := range list {
 		st := Status{Session: s}
 		switch {
-		case !s.IsSlurm():
-			_, perr := e.R.Output(ctx, fmt.Sprintf("kill -0 %d", s.HeadPID), nil)
-			st.Alive = perr == nil
-			if errors.Is(perr, remote.ErrConnection) {
-				st.Err = perr
-			}
 		case qerr != nil:
 			st.Err = qerr
 		default:
@@ -316,7 +295,7 @@ func (e *Env) GC(cancelUntracked bool) error {
 		if st.Err != nil || st.Alive {
 			continue
 		}
-		e.printf("%s has ended; cleaning up.\n", describe(st.Session))
+		e.printf("Job %s has ended; cleaning up.\n", st.JobID)
 		st.TunnelPID = 0
 		if err := e.Release(st.Session); err == nil {
 			cleaned++
@@ -347,4 +326,32 @@ func (e *Env) GC(cancelUntracked bool) error {
 		e.printf("Nothing to clean up.\n")
 	}
 	return nil
+}
+
+// describeAllocation prints the node's hardware and what the job was given,
+// e.g. "Node: 28 cores (2 sockets × 14), 125 GB RAM · Your job: 4 CPUs, 8G".
+// It is informational, so lookup failures are ignored.
+func (e *Env) describeAllocation(job slurm.Job) {
+	var parts []string
+	if node := job.NodeList; node != "" && !strings.ContainsAny(node, "[,(") {
+		ctx, cancel := timeout(15 * time.Second)
+		n, err := e.Slurm.NodeInfo(ctx, node)
+		cancel()
+		if err == nil {
+			parts = append(parts, "Node: "+n.Shape().String())
+		}
+	}
+	if job.CPUs != "" {
+		mine := "Your job: " + job.CPUs + " CPUs"
+		if job.Mem != "" && job.Mem != "0" {
+			mine += ", " + job.Mem + " memory"
+		}
+		if g := job.GPUs(); g > 0 {
+			mine += ", " + slurm.Plural(g, "GPU")
+		}
+		parts = append(parts, mine)
+	}
+	if len(parts) > 0 {
+		e.printf("  %s\n", strings.Join(parts, " · "))
+	}
 }

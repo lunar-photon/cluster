@@ -101,20 +101,20 @@ var DefaultSyncExcludes = []string{
 	".git/", "__pycache__/", "*.pyc", ".venv/", "venv/", "*.log", ".ipynb_checkpoints/",
 }
 
-// Defaults returns the built-in configuration.
+// Defaults returns the built-in configuration. It names no partition, QOS,
+// account, memory or time limit: those are site-specific, so unset fields
+// fall back to the cluster's own defaults, and `cluster init` fills them in
+// from what the cluster reports.
 func Defaults() Config {
 	return Config{
 		MountPoint:     "~/Cluster",
 		DefaultProfile: "cpu",
 		Slurm: Slurm{
-			Partition: "medium",
-			CPUs:      4,
-			Mem:       "8G",
-			Time:      "04:00:00",
+			CPUs: 4,
 		},
 		Profiles: map[string]Slurm{
 			"cpu": {},
-			"gpu": {Partition: "gpu", GPUs: 1, Mem: "16G"},
+			"gpu": {GPUs: 1},
 		},
 		Jupyter: Jupyter{Port: 8888},
 		Sync:    Sync{Exclude: DefaultSyncExcludes},

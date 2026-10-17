@@ -57,9 +57,6 @@ func ParseLegacy(src string) Config {
 	}
 	c.Jupyter.Port = port
 	gpu.GPUs = 1
-	if gpu.Partition == "" {
-		gpu.Partition = "gpu"
-	}
 	c.Profiles = map[string]Slurm{"cpu": {}, "gpu": gpu}
 	return c
 }

@@ -52,7 +52,7 @@ for f in "$FAKE"/job_*; do
   [[ -f "$f" ]] || continue
   j="${f##*/job_}"
   [[ -n "$id" && "$j" != "$id" ]] && continue
-  echo "$j${us}medium${us}cluster:shell${us}me${us}$(cat "$f")${us}0:05${us}4:00:00${us}1${us}node07"
+  echo "$j${us}medium${us}cluster:terminal${us}me${us}$(cat "$f")${us}0:05${us}4:00:00${us}1${us}node07${us}4${us}8G${us}N/A"
 done
 `
 
@@ -165,7 +165,7 @@ func TestShellExitReleasesJob(t *testing.T) {
 	if err := f.env.StartShell(shellOpts()); err != nil {
 		t.Fatalf("%v\n%s", err, f.out)
 	}
-	if !strings.Contains(f.read("sbatch_args"), "--job-name=cluster:shell") {
+	if !strings.Contains(f.read("sbatch_args"), "--job-name=cluster:terminal") {
 		t.Errorf("sbatch args: %s", f.read("sbatch_args"))
 	}
 	if !strings.Contains(f.read("script"), `"$T" -L "$S" new-session -d -s main`) {
@@ -248,7 +248,7 @@ func TestJobEndedWhileDisconnected(t *testing.T) {
 
 func TestGCForgetsEndedSessions(t *testing.T) {
 	f := newFake(t)
-	f.env.Store.Add(session.Session{JobID: "555", Kind: session.Shell})
+	f.env.Store.Add(session.Session{JobID: "555", Kind: session.Terminal})
 	os.WriteFile(filepath.Join(f.dir, "job_1001"), []byte("RUNNING"), 0o644) // untracked cluster:* job
 	if err := f.env.GC(false); err != nil {
 		t.Fatalf("%v\n%s", err, f.out)
@@ -275,7 +275,7 @@ func TestAttachCommandQuoting(t *testing.T) {
 }
 
 func TestJupyterScriptKeepsTokenOutOfArgv(t *testing.T) {
-	s := jupyterScript("module load x", "~/nb", "TOKEN123", "abcd")
+	s := jupyterScript("module load x", "~/nb", "TOKEN123")
 	if !strings.Contains(s, "export JUPYTER_TOKEN=TOKEN123") {
 		t.Error("token should be exported")
 	}

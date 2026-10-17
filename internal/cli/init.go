@@ -16,6 +16,7 @@ import (
 	"github.com/lunar-photon/cluster/internal/config"
 	"github.com/lunar-photon/cluster/internal/lifecycle"
 	"github.com/lunar-photon/cluster/internal/remote"
+	"github.com/lunar-photon/cluster/internal/slurm"
 )
 
 func initCmd(g *globals) *cobra.Command {
@@ -39,7 +40,7 @@ func initCmd(g *globals) *cobra.Command {
 			if hosts := sshConfigHosts(); len(hosts) > 0 {
 				fmt.Printf("Hosts in ~/.ssh/config: %s\n", strings.Join(hosts, ", "))
 			}
-			cfg.Host = ask(in, "Cluster host or ssh alias", firstNonEmpty(g.host, cfg.Host))
+			cfg.Host = ask(in, "Cluster host (hostname, user@hostname, or ~/.ssh/config alias)", firstNonEmpty(g.host, cfg.Host))
 			if cfg.Host == "" {
 				return fmt.Errorf("a host is required")
 			}
@@ -61,7 +62,11 @@ func initCmd(g *globals) *cobra.Command {
 			}
 			cfg.Slurm.Account = ask(in, "Default account (blank for none)", firstNonEmpty(cfg.Slurm.Account, single(accounts)))
 
-			if len(parts) > 0 {
+			if info, err := slurm.New(r).ClusterInfo(ctx); err == nil && len(info.Partitions) > 0 {
+				fmt.Println("\nPartitions on this cluster:")
+				printPartitionTable(os.Stdout, info)
+				fmt.Println()
+			} else if len(parts) > 0 {
 				names := make([]string, len(parts))
 				for i, p := range parts {
 					names[i] = p.name
@@ -79,8 +84,8 @@ func initCmd(g *globals) *cobra.Command {
 			}
 			cfg.Slurm.QOS = ask(in, "CPU QOS (blank for default)", cfg.Slurm.QOS)
 			cfg.Slurm.CPUs = askInt(in, "CPU cores", cfg.Slurm.CPUs)
-			cfg.Slurm.Mem = ask(in, "Memory", cfg.Slurm.Mem)
-			cfg.Slurm.Time = ask(in, "Walltime", cfg.Slurm.Time)
+			cfg.Slurm.Mem = ask(in, "Memory per job, e.g. 8G (blank for the partition default)", cfg.Slurm.Mem)
+			cfg.Slurm.Time = ask(in, "Time limit per job, e.g. 04:00:00 (blank for the partition limit)", cfg.Slurm.Time)
 
 			gpu := cfg.Profiles["gpu"]
 			gpu.Partition = ask(in, "GPU partition (blank to skip)", firstNonEmpty(gpu.Partition, gpuPartition(parts)))
@@ -105,10 +110,10 @@ func initCmd(g *globals) *cobra.Command {
 				return err
 			}
 			fmt.Printf("\nSaved %s.\n\n", cfg.Path)
-			if err := runSetup(lifecycle.New(cfg, r), false, false); err != nil {
+			if err := runSetup(lifecycle.New(cfg, r), false, false, false); err != nil {
 				return err
 			}
-			fmt.Println("\nReady. Try `cluster shell`, or just `cluster` for the dashboard.")
+			fmt.Println("\nReady. Try `cluster terminal`, or just `cluster` for the dashboard.")
 			return nil
 		},
 	}

@@ -26,12 +26,14 @@ import (
 
 const (
 	tabActions = iota
-	tabMonitor
+	tabCluster
+	tabJobs
 	tabSessions
 	tabSettings
+	numTabs
 )
 
-var tabNames = []string{"Actions", "Monitor", "Sessions", "Settings"}
+var tabNames = []string{"Actions", "Cluster", "Jobs", "Sessions", "Settings"}
 
 type action struct {
 	key   string
@@ -41,13 +43,12 @@ type action struct {
 }
 
 var actions = []action{
-	{"d", "Dev workspace (CPU)", "Mount storage + compute shell; both cleaned up on exit", []string{"dev", "--browse"}},
-	{"D", "Dev workspace (GPU)", "Same, on a GPU node", []string{"dev", "--browse", "--gpu"}},
-	{"s", "Compute shell (CPU)", "Shell on a dedicated node; survives Wi-Fi drops", []string{"shell"}},
-	{"S", "Compute shell (GPU)", "Shell on a dedicated GPU node", []string{"shell", "--gpu"}},
-	{"j", "JupyterLab (compute node)", "Tunneled to your browser; Ctrl+C stops it", []string{"jupyter"}},
-	{"J", "JupyterLab (GPU node)", "", []string{"jupyter", "--gpu"}},
-	{"h", "JupyterLab (login node)", "For light work only", []string{"jupyter", "--head"}},
+	{"t", "Node terminal", "Shell on a compute node; survives Wi-Fi drops", []string{"terminal"}},
+	{"T", "Node terminal (GPU)", "Same, on a GPU node", []string{"terminal", "--gpu"}},
+	{"d", "Node terminal + cluster mount", "Also mounts cluster storage locally for the session", []string{"terminal", "--mount", "--browse"}},
+	{"D", "Node terminal + cluster mount (GPU)", "Same, on a GPU node", []string{"terminal", "--mount", "--browse", "--gpu"}},
+	{"j", "Jupyter session on node", "JupyterLab on a compute node, in your browser", []string{"jupyter"}},
+	{"J", "Jupyter session on node (GPU)", "Same, on a GPU node", []string{"jupyter", "--gpu"}},
 	{"m", "Mount / unmount storage", "Toggle the sshfs mount", nil},
 	{"p", "Push code ->", "rsync this directory to the cluster", []string{"sync", "push"}},
 	{"P", "Pull code <-", "rsync it back", []string{"sync", "pull"}},
@@ -57,7 +58,7 @@ var actions = []action{
 
 type refreshMsg struct {
 	jobs     []slurm.Job
-	parts    []slurm.Partition
+	info     *slurm.Info
 	sessions []lifecycle.Status
 	err      error
 }
@@ -116,7 +117,7 @@ var fields = []field{
 	{"QOS", func(c *config.Config) string { return c.Slurm.QOS }, func(c *config.Config, v string) error { c.Slurm.QOS = v; return nil }},
 	{"CPU cores", func(c *config.Config) string { return itoa(c.Slurm.CPUs) }, func(c *config.Config, v string) error { return intField(&c.Slurm.CPUs)(v) }},
 	{"Memory", func(c *config.Config) string { return c.Slurm.Mem }, func(c *config.Config, v string) error { c.Slurm.Mem = v; return nil }},
-	{"Walltime", func(c *config.Config) string { return c.Slurm.Time }, func(c *config.Config, v string) error { c.Slurm.Time = v; return nil }},
+	{"Time limit", func(c *config.Config) string { return c.Slurm.Time }, func(c *config.Config, v string) error { c.Slurm.Time = v; return nil }},
 	{"GPU partition", func(c *config.Config) string { return gpuProfile(c).Partition }, func(c *config.Config, v string) error {
 		setGPU(c, func(p *config.Slurm) { p.Partition = v })
 		return nil
@@ -148,7 +149,7 @@ type model struct {
 	self string
 
 	tab         int
-	cursor      [4]int
+	cursor      [numTabs]int
 	width       int
 	height      int
 	mounted     bool
@@ -157,7 +158,8 @@ type model struct {
 	lastRefresh time.Time
 
 	jobs     []slurm.Job
-	parts    []slurm.Partition
+	info     *slurm.Info
+	sums     []slurm.Summary
 	sessions []lifecycle.Status
 
 	status  string
@@ -168,7 +170,7 @@ type model struct {
 
 // Run starts the dashboard. r may be nil when no host is configured.
 func Run(cfg config.Config, r *remote.Client, self string) error {
-	m := model{cfg: cfg, self: self}
+	m := model{cfg: cfg, self: self, tab: tabCluster}
 	if r != nil {
 		m.env = lifecycle.New(cfg, r)
 		m.connected = r.MasterAlive()
@@ -208,13 +210,20 @@ func (m *model) refresh() tea.Cmd {
 	}
 	m.refreshing = true
 	env := m.env
+	preferred := ""
+	if p, err := m.cfg.Profile(""); err == nil {
+		preferred = p.QOS
+	}
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		var msg refreshMsg
 		msg.jobs, msg.err = env.Slurm.Jobs(ctx)
 		if msg.err == nil {
-			msg.parts, msg.err = env.Slurm.Partitions(ctx)
+			msg.info, msg.err = env.Slurm.ClusterInfo(ctx)
+			if msg.info != nil {
+				msg.info.PreferredQOS = preferred
+			}
 		}
 		msg.sessions, _ = env.Sessions(ctx)
 		return msg
@@ -251,7 +260,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.connected = true
 			m.errMsg = ""
-			m.jobs, m.parts = msg.jobs, msg.parts
+			m.jobs, m.info = msg.jobs, msg.info
+			m.sums = m.info.Summarize()
 		}
 		m.sessions = msg.sessions
 		m.clampCursors()
@@ -281,12 +291,12 @@ func (m model) updateKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c", "esc":
 		return m, tea.Quit
 	case "tab", "right":
-		m.tab = (m.tab + 1) % len(tabNames)
+		m.tab = (m.tab + 1) % numTabs
 		return m, nil
 	case "shift+tab", "left":
-		m.tab = (m.tab + len(tabNames) - 1) % len(tabNames)
+		m.tab = (m.tab + numTabs - 1) % numTabs
 		return m, nil
-	case "1", "2", "3", "4":
+	case "1", "2", "3", "4", "5":
 		m.tab = int(key[0] - '1')
 		return m, nil
 	case "r":
@@ -315,6 +325,17 @@ func (m model) updateKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.runAction(a)
 			}
 		}
+	case tabCluster:
+		if len(m.sums) == 0 {
+			break
+		}
+		s := m.sums[m.cursor[tabCluster]]
+		switch key {
+		case "enter", "t":
+			return m.inPartition(s, "Node terminal on "+s.Name, "terminal")
+		case "j":
+			return m.inPartition(s, "Jupyter on "+s.Name, "jupyter")
+		}
 	case tabSessions:
 		if len(m.sessions) == 0 {
 			break
@@ -338,6 +359,23 @@ func (m model) updateKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// inPartition starts a session in the selected partition, adding the QOS
+// the partition requires and a GPU when it has them.
+func (m model) inPartition(s slurm.Summary, what, sub string) (tea.Model, tea.Cmd) {
+	if !s.Allowed {
+		m.errMsg = "You can't use " + s.Name + ": " + s.Why
+		return m, nil
+	}
+	args := []string{sub, "-p", s.Name}
+	if m.info != nil && len(s.AllowedVia) > 0 {
+		args = append(args, "-q", m.info.QOSFor(s))
+	}
+	if s.GPUsTotal > 0 {
+		args = append(args, "--gpus", "1")
+	}
+	return m, m.run(what, args...)
 }
 
 func (m model) updateEditing(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -421,7 +459,7 @@ func (m model) runAction(a action) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) clampCursors() {
-	limits := [4]int{len(actions), len(m.jobs), len(m.sessions), len(fields)}
+	limits := [numTabs]int{len(actions), len(m.sums), len(m.jobs), len(m.sessions), len(fields)}
 	for i, n := range limits {
 		if m.cursor[i] >= n {
 			m.cursor[i] = max(0, n-1)
@@ -439,6 +477,7 @@ func firstLine(s string) string {
 var (
 	accent   = lipgloss.AdaptiveColor{Light: "#0b7285", Dark: "#66d9e8"}
 	muted    = lipgloss.AdaptiveColor{Light: "#666666", Dark: "#8a8a8a"}
+	faint    = lipgloss.AdaptiveColor{Light: "#cccccc", Dark: "#444444"}
 	good     = lipgloss.AdaptiveColor{Light: "#2b8a3e", Dark: "#8ce99a"}
 	bad      = lipgloss.AdaptiveColor{Light: "#c92a2a", Dark: "#ff8787"}
 	warn     = lipgloss.AdaptiveColor{Light: "#e67700", Dark: "#ffd43b"}
@@ -446,6 +485,9 @@ var (
 	mutedSt  = lipgloss.NewStyle().Foreground(muted)
 	accentSt = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	selSt    = lipgloss.NewStyle().Foreground(accent).Bold(true)
+	goodSt   = lipgloss.NewStyle().Foreground(good)
+	warnSt   = lipgloss.NewStyle().Foreground(warn)
+	badSt    = lipgloss.NewStyle().Foreground(bad)
 	tabOn    = lipgloss.NewStyle().Bold(true).Foreground(accent).Underline(true).Padding(0, 2)
 	tabOff   = lipgloss.NewStyle().Foreground(muted).Padding(0, 2)
 )
@@ -459,14 +501,16 @@ func (m model) View() string {
 	host := m.cfg.Host
 	if host == "" {
 		host = "(no host)"
+	} else if m.info != nil && m.info.User != "" && !strings.Contains(host, "@") {
+		host = m.info.User + "@" + host
 	}
-	conn := lipgloss.NewStyle().Foreground(bad).Render("● offline")
+	conn := badSt.Render("● offline")
 	if m.connected {
-		conn = lipgloss.NewStyle().Foreground(good).Render("● connected")
+		conn = goodSt.Render("● connected")
 	}
 	mnt := mutedSt.Render("not mounted")
 	if m.mounted {
-		mnt = lipgloss.NewStyle().Foreground(good).Render("mounted at " + m.cfg.MountPoint)
+		mnt = goodSt.Render("mounted at " + m.cfg.MountPoint)
 	}
 	left := titleSt.Render("cluster") + " " + accentSt.Render(host) + "  " + conn
 	right := "drive: " + mnt
@@ -476,7 +520,10 @@ func (m model) View() string {
 	var tabs []string
 	for i, n := range tabNames {
 		label := fmt.Sprintf("%d %s", i+1, n)
-		if i == tabSessions && len(m.sessions) > 0 {
+		switch {
+		case i == tabJobs && len(m.jobs) > 0:
+			label += fmt.Sprintf(" (%d)", len(m.jobs))
+		case i == tabSessions && len(m.sessions) > 0:
 			label += fmt.Sprintf(" (%d)", len(m.sessions))
 		}
 		if i == m.tab {
@@ -492,8 +539,10 @@ func (m model) View() string {
 	switch m.tab {
 	case tabActions:
 		body = m.viewActions()
-	case tabMonitor:
-		body = m.viewMonitor(bodyHeight)
+	case tabCluster:
+		body = m.viewCluster()
+	case tabJobs:
+		body = m.viewJobs(bodyHeight)
 	case tabSessions:
 		body = m.viewSessions()
 	case tabSettings:
@@ -504,9 +553,9 @@ func (m model) View() string {
 
 	switch {
 	case m.errMsg != "":
-		b.WriteString(lipgloss.NewStyle().Foreground(bad).Render(truncate(m.errMsg, m.width)) + "\n")
+		b.WriteString(badSt.Render(truncate(m.errMsg, m.width)) + "\n")
 	case m.status != "":
-		b.WriteString(lipgloss.NewStyle().Foreground(warn).Render(truncate(m.status, m.width)) + "\n")
+		b.WriteString(warnSt.Render(truncate(m.status, m.width)) + "\n")
 	default:
 		b.WriteString("\n")
 	}
@@ -515,10 +564,12 @@ func (m model) View() string {
 }
 
 func (m model) help() string {
-	common := "tab/1-4 switch · r refresh · c connect · q quit"
+	common := "tab/1-5 switch · r refresh · c connect · q quit"
 	switch m.tab {
 	case tabActions:
 		return "↑↓ select · enter run · letter shortcut · " + common
+	case tabCluster:
+		return "↑↓ partition · t/enter node terminal there · j Jupyter there · " + common
 	case tabSessions:
 		return "↑↓ select · a/enter attach · x stop · g clean up · " + common
 	case tabSettings:
@@ -530,6 +581,16 @@ func (m model) help() string {
 	return common
 }
 
+// summary finds the summary for a partition name ("" = the default partition).
+func (m model) summary(name string) (slurm.Summary, bool) {
+	for _, s := range m.sums {
+		if s.Name == name || (name == "" && s.Default) {
+			return s, true
+		}
+	}
+	return slurm.Summary{}, false
+}
+
 func (m model) viewActions() string {
 	var b strings.Builder
 	for i, a := range actions {
@@ -539,79 +600,265 @@ func (m model) viewActions() string {
 			cursor = selSt.Render("▸ ")
 			label = selSt.Render(label)
 		}
-		fmt.Fprintf(&b, "%s%s  %-28s %s\n", cursor, accentSt.Render(a.key), label, mutedSt.Render(a.desc))
+		fmt.Fprintf(&b, "%s%s  %s %s\n", cursor, accentSt.Render(a.key), label+strings.Repeat(" ", max(1, 37-len(a.label))), mutedSt.Render(a.desc))
+	}
+
+	// What the buttons will ask for, and whether it's free right now.
+	b.WriteString("\n" + accentSt.Render("What these request") + mutedSt.Render("  (change in Settings or with flags)") + "\n")
+	for _, prof := range []struct{ label, name string }{{"CPU", ""}, {"GPU", "gpu"}} {
+		p, err := m.cfg.Profile(prof.name)
+		if err != nil {
+			fmt.Fprintf(&b, "  %-4s %s\n", prof.label, mutedSt.Render("no GPU profile configured"))
+			continue
+		}
+		fmt.Fprintf(&b, "  %-4s %s\n", prof.label, requestText(p))
+		if s, ok := m.summary(p.Partition); ok {
+			fmt.Fprintf(&b, "       %s\n", m.availabilityHint(s, p))
+		}
 	}
 	return b.String()
 }
 
-func (m model) viewMonitor(height int) string {
+func requestText(p config.Slurm) string {
+	part := p.Partition
+	if part == "" {
+		part = "default partition"
+	}
+	parts := []string{part}
+	if p.CPUs > 0 {
+		parts = append(parts, slurm.Plural(p.CPUs, "CPU"))
+	}
+	if p.GPUs > 0 {
+		parts = append(parts, slurm.Plural(p.GPUs, "GPU"))
+	}
+	mem := p.Mem
+	if mem == "" {
+		mem = "default memory"
+	}
+	tm := p.Time
+	if tm == "" {
+		tm = "partition time limit"
+	}
+	parts = append(parts, mem, tm)
+	if p.QOS != "" {
+		parts = append(parts, "QOS "+p.QOS)
+	}
+	return strings.Join(parts, " · ")
+}
+
+// availabilityHint says whether a request would start now in partition s.
+func (m model) availabilityHint(s slurm.Summary, p config.Slurm) string {
+	if !s.Allowed {
+		return badSt.Render("you can't use " + s.Name + ": " + s.Why)
+	}
+	a := m.info.AvailableTo(s)
+	text := fmt.Sprintf("%s now: %s free on %s", s.Name, slurm.Plural(s.CPUsFree, "CPU"), slurm.Plural(s.Idle+s.Mixed, "node"))
+	if s.GPUsTotal > 0 {
+		text += ", " + slurm.Plural(s.GPUsFree, "GPU") + " free"
+	}
+	need := max(1, p.CPUs)
+	switch {
+	case s.BestFreeCPUs >= need && a.CPUs >= need && (p.GPUs == 0 || a.GPUs >= p.GPUs):
+		return goodSt.Render("● " + text + " — should start right away")
+	case a.CPUs < need && a.LimitedBy != "free resources":
+		return warnSt.Render("● " + text + " — your " + a.LimitedBy + " is used up; it will queue")
+	default:
+		return warnSt.Render("● " + text + " — expect to wait in the queue")
+	}
+}
+
+func (m model) viewCluster() string {
+	if m.env == nil {
+		return mutedSt.Render("No host configured.")
+	}
+	if m.info == nil {
+		return mutedSt.Render("Loading cluster information…")
+	}
+	var b strings.Builder
+	b.WriteString(accentSt.Render("You") + "  " + m.info.AccountText() + "\n")
+	for _, line := range m.info.UsageText() {
+		b.WriteString("     " + mutedSt.Render(line) + "\n")
+	}
+	when := m.lastRefresh.Format("15:04:05")
+	b.WriteString("\n" + accentSt.Render("Partitions") + mutedSt.Render("  updated "+when+", every 30s · nodes: idle/partly used/full/unavailable") + "\n")
+
+	sel := m.cursor[tabCluster]
+	rows := make([][]string, 0, len(m.sums))
+	for _, s := range m.sums {
+		name := s.Name
+		if s.Default {
+			name += "*"
+		}
+		gpus := "-"
+		if s.GPUsTotal > 0 {
+			gpus = fmt.Sprintf("%d/%d", s.GPUsFree, s.GPUsTotal)
+		}
+		mine := "-"
+		if s.Allowed {
+			a := m.info.AvailableTo(s)
+			mine = slurm.Plural(a.CPUs, "CPU")
+			if s.GPUsTotal > 0 {
+				mine += ", " + slurm.Plural(a.GPUs, "GPU")
+			}
+		}
+		rows = append(rows, []string{
+			name, s.AccessText(), slurm.Unlimited(s.MaxTime), s.StateText(),
+			freeBar(s.CPUsFree, s.CPUsTotal) + fmt.Sprintf(" %d/%d", s.CPUsFree, s.CPUsTotal),
+			gpus, mine, compactShape(s),
+		})
+	}
+	t := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(mutedSt).
+		Headers("PARTITION", "ACCESS", "TIME LIMIT", "NODES", "FREE CPUs", "GPUs", "FOR YOU NOW", "EACH NODE").
+		Rows(rows...).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			st := lipgloss.NewStyle().Padding(0, 1)
+			switch {
+			case row == table.HeaderRow:
+				return st.Bold(true).Foreground(accent)
+			case row == sel:
+				st = st.Bold(true).Foreground(accent)
+			case row >= 0 && row < len(m.sums) && !m.sums[row].Allowed:
+				st = st.Foreground(muted)
+			}
+			if col == 1 && row >= 0 && row < len(m.sums) && row != sel {
+				if m.sums[row].Allowed {
+					st = st.Foreground(good)
+				}
+			}
+			return st
+		})
+	b.WriteString(t.Render() + "\n")
+
+	if sel < len(m.sums) {
+		b.WriteString("\n")
+		detail := m.info.Detail(m.sums[sel])
+		b.WriteString(accentSt.Render(detail[0]) + "\n")
+		wrap := lipgloss.NewStyle().Width(max(20, m.width-4))
+		for _, line := range detail[1:] {
+			b.WriteString(wrap.Render("  "+line) + "\n")
+		}
+	}
+	return b.String()
+}
+
+// freeBar draws free capacity as a 10-cell bar: green cells are free.
+func freeBar(free, total int) string {
+	if total <= 0 {
+		return ""
+	}
+	const cells = 10
+	n := free * cells / total
+	if free > 0 && n == 0 {
+		n = 1
+	}
+	return goodSt.Render(strings.Repeat("█", n)) + lipgloss.NewStyle().Foreground(faint).Render(strings.Repeat("█", cells-n))
+}
+
+// compactShape is a one-line node description for the table, e.g.
+// "28 cores · 2×14 · 125 GB · 1-2 tesla GPUs".
+func compactShape(s slurm.Summary) string {
+	if len(s.Shapes) == 0 {
+		return "-"
+	}
+	sh := s.Shapes[0]
+	text := fmt.Sprintf("%d cores · %d×%d · %s", sh.CPUs, sh.Sockets, sh.CoresPerSocket, slurm.FormatMem(sh.MemMB))
+	minG, maxG := sh.GPUs, sh.GPUs
+	mixed := false
+	for _, o := range s.Shapes[1:] {
+		if o.CPUs != sh.CPUs || o.MemMB != sh.MemMB || o.Sockets != sh.Sockets {
+			mixed = true
+		}
+		minG, maxG = min(minG, o.GPUs), max(maxG, o.GPUs)
+	}
+	if maxG > 0 {
+		g := strconv.Itoa(maxG)
+		if minG != maxG {
+			g = fmt.Sprintf("%d-%d", minG, maxG)
+		}
+		t := sh.GPUType
+		if t != "" {
+			t += " "
+		}
+		text += " · " + g + " " + t + "GPU"
+		if maxG != 1 {
+			text += "s"
+		}
+	}
+	if mixed {
+		text += " (+ other node types)"
+	}
+	return text
+}
+
+func (m model) viewJobs(height int) string {
 	if m.env == nil {
 		return mutedSt.Render("No host configured.")
 	}
 	var b strings.Builder
-	when := "never"
-	if !m.lastRefresh.IsZero() {
-		when = m.lastRefresh.Format("15:04:05")
+	running, cpus, gpus := 0, 0, 0
+	for _, j := range m.jobs {
+		if j.State == "RUNNING" {
+			running++
+			n, _ := strconv.Atoi(j.CPUs)
+			cpus += n
+			gpus += j.GPUs()
+		}
 	}
-	b.WriteString(accentSt.Render("Your jobs") + mutedSt.Render("  updated "+when+", every 30s") + "\n")
-
-	maxJobs := max(1, height/2-4)
-	jobRows := [][]string{}
+	summary := fmt.Sprintf("%s, %d running using %s", slurm.Plural(len(m.jobs), "job"), running, slurm.Plural(cpus, "CPU"))
+	if gpus > 0 {
+		summary += " and " + slurm.Plural(gpus, "GPU")
+	}
+	b.WriteString(accentSt.Render("Your jobs") + "  " + mutedSt.Render(summary) + "\n")
+	if len(m.jobs) == 0 {
+		b.WriteString(mutedSt.Render("  no jobs") + "\n")
+		return b.String()
+	}
+	maxRows := max(1, height-6)
+	rows := [][]string{}
 	for i, j := range m.jobs {
-		if i == maxJobs {
-			jobRows = append(jobRows, []string{"…", fmt.Sprintf("%d more", len(m.jobs)-maxJobs), "", "", "", ""})
+		if i == maxRows {
+			rows = append(rows, []string{"…", fmt.Sprintf("%d more", len(m.jobs)-maxRows), "", "", "", "", "", "", ""})
 			break
 		}
-		jobRows = append(jobRows, []string{j.ID, j.Partition, j.Name, j.State, j.Time + " / " + j.TimeLimit, j.NodeList})
+		mem := j.Mem
+		if mem == "0" {
+			mem = "default"
+		}
+		g := "-"
+		if n := j.GPUs(); n > 0 {
+			g = strconv.Itoa(n)
+		}
+		rows = append(rows, []string{j.ID, j.Partition, j.Name, j.State, j.CPUs, mem, g, j.Time + " / " + j.TimeLimit, j.NodeList})
 	}
-	if len(jobRows) == 0 {
-		b.WriteString(mutedSt.Render("  no jobs") + "\n")
-	} else {
-		b.WriteString(m.table([]string{"JOB", "PARTITION", "NAME", "STATE", "TIME / LIMIT", "NODES (REASON)"}, jobRows, 3) + "\n")
-	}
-
-	b.WriteString("\n" + accentSt.Render("Partitions") + "\n")
-	partRows := [][]string{}
-	for _, p := range m.parts {
-		partRows = append(partRows, []string{p.Name, p.Avail, p.TimeLimit, p.Nodes, p.State})
-	}
-	if len(partRows) == 0 {
-		b.WriteString(mutedSt.Render("  no data") + "\n")
-	} else {
-		b.WriteString(m.table([]string{"PARTITION", "AVAIL", "TIMELIMIT", "NODES", "STATE"}, partRows, 4))
-	}
-	return b.String()
-}
-
-func (m model) table(headers []string, rows [][]string, stateCol int) string {
-	return table.New().
+	t := table.New().
 		Border(lipgloss.RoundedBorder()).
 		BorderStyle(mutedSt).
-		Headers(headers...).
+		Headers("JOB", "PARTITION", "NAME", "STATE", "CPUs", "MEMORY", "GPUs", "TIME / LIMIT", "NODES (REASON)").
 		Rows(rows...).
 		StyleFunc(func(row, col int) lipgloss.Style {
-			s := lipgloss.NewStyle().Padding(0, 1)
+			st := lipgloss.NewStyle().Padding(0, 1)
 			if row == table.HeaderRow {
-				return s.Bold(true).Foreground(accent)
+				return st.Bold(true).Foreground(accent)
 			}
-			if col == stateCol && row >= 0 && row < len(rows) {
-				switch v := rows[row][col]; {
-				case v == "RUNNING" || v == "idle" || v == "mixed":
-					return s.Foreground(good)
-				case v == "PENDING" || strings.HasPrefix(v, "alloc"):
-					return s.Foreground(warn)
-				case strings.HasPrefix(v, "down") || strings.HasPrefix(v, "drain"):
-					return s.Foreground(bad)
+			if col == 3 && row >= 0 && row < len(rows) {
+				switch rows[row][3] {
+				case "RUNNING":
+					return st.Foreground(good)
+				case "PENDING":
+					return st.Foreground(warn)
 				}
 			}
-			return s
-		}).
-		Render()
+			return st
+		})
+	b.WriteString(t.Render())
+	return b.String()
 }
 
 func (m model) viewSessions() string {
 	if len(m.sessions) == 0 {
-		return mutedSt.Render("No sessions. Start one from Actions; it will be listed here until released.")
+		return mutedSt.Render("No sessions. Start one from Actions or Cluster; it will be listed here until released.")
 	}
 	var b strings.Builder
 	for i, s := range m.sessions {
@@ -635,7 +882,7 @@ func (m model) viewSessions() string {
 		if node == "" {
 			node = s.Node
 		}
-		fmt.Fprintf(&b, "%s%-10s %-8s %-8s %s  %s  %s\n", cursor, id, s.Kind, s.Profile,
+		fmt.Fprintf(&b, "%s%-10s %-15s %-8s %s  %s  %s\n", cursor, id, s.Kind, s.Profile,
 			lipgloss.NewStyle().Foreground(col).Render(state), node,
 			mutedSt.Render("started "+s.Created.Format("Jan 2 15:04")))
 		if s.URL != "" {
@@ -649,7 +896,7 @@ func (m model) viewSessions() string {
 
 func (m model) viewSettings() string {
 	var b strings.Builder
-	b.WriteString(mutedSt.Render("Saved to "+m.cfg.Path+". Profiles beyond cpu/gpu: `cluster config`.") + "\n\n")
+	b.WriteString(mutedSt.Render("Saved to "+m.cfg.Path+". Blank fields use the cluster's defaults. Profiles beyond cpu/gpu: `cluster config`.") + "\n\n")
 	for i, f := range fields {
 		label := fmt.Sprintf("%-15s", f.label)
 		cursor := "  "

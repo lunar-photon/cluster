@@ -24,8 +24,9 @@ const exitDetached = 197
 type ShellOpts struct {
 	Req     slurm.Request
 	Profile string
-	// Dev mounts cluster storage for the lifetime of the session.
-	Dev       bool
+	// Mount also mounts cluster storage for the lifetime of the session
+	// ("node terminal + cluster mount").
+	Mount     bool
 	RemoteDir string
 	Browse    bool
 	// Persist keeps the shell in tmux on the node (when tmux exists there)
@@ -48,7 +49,7 @@ const findTmux = `T=$(command -v tmux 2>/dev/null || true); ` +
 // Users without their own tmux config get mouse scrolling and a status bar
 // that says how to detach.
 func holdScript(persist bool) string {
-	s := "#!/bin/bash\n# Holds an interactive allocation for `cluster shell` / `cluster dev`.\n"
+	s := "#!/bin/bash\n# Holds the allocation for a `cluster terminal` session.\n"
 	if persist {
 		s += findTmux + "\n" +
 			`if [ -n "$T" ]; then
@@ -138,14 +139,14 @@ func (e *Env) StartShell(o ShellOpts) error {
 		return err
 	}
 	sess := session.Session{
-		Kind:    session.Shell,
+		Kind:    session.Terminal,
 		Host:    e.R.Host,
 		Profile: o.Profile,
 		Created: time.Now(),
 	}
 
-	if o.Dev {
-		sess.Kind = session.Dev
+	if o.Mount {
+		sess.Kind = session.TerminalMount
 		mp := e.Cfg.LocalMountPoint()
 		created, err := mount.Mount(e.R, o.RemoteDir, mp)
 		switch {
@@ -168,7 +169,7 @@ func (e *Env) StartShell(o ShellOpts) error {
 	}
 
 	ctx, cancel := timeout(60 * time.Second)
-	o.Req.Name = slurm.JobPrefix + string(sess.Kind)
+	o.Req.Name = slurm.JobPrefix + strings.ReplaceAll(string(sess.Kind), "+", "-")
 	id, err := e.Slurm.Submit(ctx, o.Req, holdScript(o.Persist), "--output=/dev/null")
 	cancel()
 	if err != nil {
@@ -190,7 +191,7 @@ func (e *Env) StartShell(o ShellOpts) error {
 	return e.attachLoop(sess, o.Persist, o.Overlap)
 }
 
-// Attach reconnects to a tracked shell/dev session, or re-tunnels a Jupyter one.
+// Attach reconnects to a tracked terminal session, or re-tunnels a Jupyter one.
 func (e *Env) Attach(jobID string, persist, overlap, browse bool) error {
 	if err := e.R.EnsureMaster(); err != nil {
 		return err
@@ -250,6 +251,7 @@ func (e *Env) waitRunning(id string) error {
 			return fmt.Errorf("job %s ended before it started (state %q)", id, job.State)
 		case job.State == "RUNNING":
 			e.printf("\r\033[KJob %s running on %s.\n", id, job.NodeList)
+			e.describeAllocation(job)
 			return nil
 		}
 		status := fmt.Sprintf("%s %s", job.State, job.NodeList)

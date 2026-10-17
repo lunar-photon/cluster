@@ -62,7 +62,13 @@ type Job struct {
 	TimeLimit string
 	Nodes     string
 	NodeList  string // nodelist when running, pending reason otherwise
+	CPUs      string
+	Mem       string // minimum memory requested, e.g. "8G"; "0" means the default
+	GRES      string // e.g. "gres:gpu:1"; "N/A" when none
 }
+
+// GPUs is the number of GPUs the job requested per node.
+func (j Job) GPUs() int { return gresGPUs(j.GRES) }
 
 // Partition is one sinfo row.
 type Partition struct {
@@ -87,7 +93,7 @@ func New(r *remote.Client) *Client { return &Client{R: r} }
 
 const sep = "\x1f" // ASCII unit separator: cannot appear in job names typed at a shell
 
-var squeueFormat = strings.Join([]string{"%i", "%P", "%j", "%u", "%T", "%M", "%l", "%D", "%R"}, sep)
+var squeueFormat = strings.Join([]string{"%i", "%P", "%j", "%u", "%T", "%M", "%l", "%D", "%R", "%C", "%m", "%b"}, sep)
 
 // Jobs lists the current user's jobs. With ids, it lists only those jobs.
 func (c *Client) Jobs(ctx context.Context, ids ...string) ([]Job, error) {
@@ -113,7 +119,12 @@ func parseSqueueText(out string) []Job {
 		if len(f) < 9 {
 			continue
 		}
-		jobs = append(jobs, Job{f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]})
+		j := Job{ID: f[0], Partition: f[1], Name: f[2], User: f[3], State: f[4], Time: f[5],
+			TimeLimit: f[6], Nodes: f[7], NodeList: f[8]}
+		if len(f) >= 12 {
+			j.CPUs, j.Mem, j.GRES = f[9], f[10], f[11]
+		}
+		jobs = append(jobs, j)
 	}
 	return jobs
 }
