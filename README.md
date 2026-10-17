@@ -6,6 +6,7 @@ cluster turns remote HPC infrastructure into an intuitive extension of your lapt
 - Launch remote JupyterLab sessions with automatic port tunneling and browser opening.
 - Mount cluster storage locally so you can copy-paste files, drag-and-drop datasets, and edit code natively in local editors.
 - Borrow dedicated compute or GPU nodes interactively to run code instantly without waiting for batch job output logs.
+- Automatic session lifecycle: closing your terminal window or typing exit automatically unmounts drives, cancels Slurm allocations, and releases compute resources.
 - Synchronize project code bi-directionally in milliseconds.
 - Monitor active Slurm queues, running jobs, and partition availability from your local terminal.
 
@@ -13,11 +14,12 @@ cluster turns remote HPC infrastructure into an intuitive extension of your lapt
 
 ## Features
 
-- Interactive Compute Shells: Jump directly into a dedicated Slurm node (CPU or GPU) with an exclusive bash prompt. Code runs and occupies resources interactively until you close the session.
-- Seamless Local Drive Mount: Uses SSHFS to mount your cluster home directly into your local file manager (Dolphin / Nautilus). Copy, paste, and view plots without manual downloads.
-- Automated Jupyter Tunneling: Auto-discovers free ports, sets up secure multi-hop SSH tunnels, extracts session tokens, and launches your default browser.
-- Smart Code Synchronization: Push and pull codebase changes rapidly with rsync, automatically ignoring heavy artifacts (.git, virtualenvs, __pycache__, checkpoints).
-- Instant Status Dashboard: View your queued jobs, remaining allocation runtimes, and cluster partition health in real time.
+- Complete Workspace Mode (`cluster dev`): Mounts cluster storage locally, opens Dolphin, and connects an interactive compute or GPU shell. When you close the terminal or type exit, it automatically unmounts the drive and frees the compute node.
+- Interactive Compute Shells (`cluster shell`): Jump directly into a dedicated Slurm node (CPU or GPU) with an exclusive bash prompt. Code runs and occupies resources interactively until you close the session.
+- Seamless Local Drive Mount (`cluster mount` / `cluster unmount`): Uses SSHFS to mount your cluster home directly into your local file manager. Copy, paste, and view plots without manual downloads.
+- Automated Jupyter Tunneling (`cluster jupyter`): Auto-discovers free ports, sets up secure multi-hop SSH tunnels, extracts session tokens, and launches your default browser.
+- Smart Code Synchronization (`cluster sync`): Push and pull codebase changes rapidly with rsync, automatically ignoring heavy artifacts (.git, virtualenvs, __pycache__, checkpoints).
+- Instant Status Dashboard (`cluster status`): View your queued jobs, remaining allocation runtimes, and cluster partition health in real time.
 - Configurable Defaults: Store frequent settings (cluster host, Slurm accounts, default partitions) in ~/.config/cluster/config.
 
 ---
@@ -105,8 +107,24 @@ MOUNT_POINT="$HOME/Cluster"
 
 ## Commands and Usage
 
-### 1. Interactive Compute Shell (`cluster shell`)
-Borrow an exclusive compute node for interactive coding, testing, and debugging:
+### 1. All-in-One Dev Workspace (`cluster dev`)
+The fastest way to work on the cluster:
+
+```bash
+# Mounts ~/Cluster, opens Dolphin file manager, and gives you a dedicated compute shell
+cluster dev -b
+
+# Or request a GPU node
+cluster dev --gpu -b
+```
+Automatic Cleanup on Terminal Close:
+When you close the terminal window or type `exit`:
+1. It automatically unmounts the `~/Cluster` local drive cleanly.
+2. It automatically releases the allocated Slurm compute/GPU node so you do not waste cluster allocation hours.
+3. It closes all tunnels and background sessions.
+
+### 2. Interactive Compute Shell (`cluster shell`)
+Borrow an exclusive compute node for interactive coding, testing, and debugging without mounting:
 
 ```bash
 # Request standard compute node (uses your config defaults: 4 CPUs, 8GB RAM)
@@ -118,9 +136,9 @@ cluster shell --gpu
 # Customize resource request on the fly
 cluster shell -c 8 -m 32G -t 02:00:00
 ```
-This drops you straight into a terminal prompt running on the compute node (e.g., node18). Run python scripts, simulations, or tests directly. Type `exit` when done to release the node.
+This drops you straight into a terminal prompt running on the compute node. Type `exit` or close the terminal window to release the node immediately.
 
-### 2. Local Storage Mount (`cluster mount` / `cluster unmount`)
+### 3. Local Storage Mount (`cluster mount` / `cluster unmount`)
 Mount remote cluster files directly into your local filesystem:
 
 ```bash
@@ -132,7 +150,7 @@ cluster unmount
 ```
 Once mounted, you can copy-paste files using standard keyboard shortcuts (Ctrl+C / Ctrl+V), drag-and-drop datasets, or open generated figures directly in your local PDF/image viewer.
 
-### 3. Remote JupyterLab (`cluster jupyter`)
+### 4. Remote JupyterLab (`cluster jupyter`)
 Launch a full visual JupyterLab session with zero manual port management:
 
 ```bash
@@ -149,7 +167,7 @@ cluster jupyter --gpu
 cluster jupyter -d ~/projects/cosmology
 ```
 
-### 4. Fast Code Sync (`cluster sync`)
+### 5. Fast Code Sync (`cluster sync`)
 Synchronize local code changes to the cluster without copying huge caches or git history:
 
 ```bash
@@ -160,14 +178,14 @@ cluster sync push . ~/projects/mycode
 cluster sync pull ~/projects/mycode .
 ```
 
-### 5. Cluster Status Dashboard (`cluster status`)
+### 6. Cluster Status Dashboard (`cluster status`)
 Check your job queue and cluster health instantly from your local terminal:
 
 ```bash
 cluster status
 ```
 
-### 6. One-off Compute Execution (`cluster exec`)
+### 7. One-off Compute Execution (`cluster exec`)
 Dispatch a single command to an allocated compute node without writing a job submission script:
 
 ```bash
@@ -182,10 +200,11 @@ cluster exec --cpus 8 "python train.py --epochs 50"
 Usage: cluster <command> [OPTIONS]
 
 Commands:
-  jupyter [OPTIONS]       Launch remote JupyterLab with automated tunneling
-  shell [OPTIONS]         Allocate an interactive compute/GPU shell
+  dev [OPTIONS]           All-in-one workspace (mount + compute shell + auto-cleanup)
+  shell [OPTIONS]         Allocate an interactive compute/GPU shell (auto-freed on close)
   mount [OPTIONS]         Mount cluster filesystem locally via SSHFS
   unmount                 Safely unmount the local cluster drive
+  jupyter [OPTIONS]       Launch remote JupyterLab with automated tunneling
   sync <push|pull>        Fast bi-directional code sync via rsync
   status                  View active Slurm jobs, queues, and node availability
   exec "<command>"        Run a command directly inside an allocated compute node

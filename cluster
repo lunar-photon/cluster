@@ -3,11 +3,13 @@
 # cluster - Unified HPC Developer Suite
 # Bridges remote clusters with your local workstation:
 # Jupyter tunneling, interactive compute shells, drive mounting, code syncing, and job monitoring.
+# Includes automatic lifecycle management: automatically unmounts drives and releases
+# compute nodes when the terminal session closes.
 #
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cluster"
 CONFIG_FILE="$CONFIG_DIR/config"
 LEGACY_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/cluster-jupyter/config"
@@ -74,17 +76,26 @@ Bridging remote clusters seamlessly with your local workstation
 
 Available Commands:
 
-  cluster jupyter [OPTIONS]
-    Launch remote JupyterLab with automatic port forwarding and browser opening.
+  cluster dev [OPTIONS]
+    All-in-one local-remote workspace.
+    1. Mounts cluster storage to ~/Cluster (copy-paste / drag-and-drop in Dolphin).
+    2. Allocates a dedicated compute/GPU node and drops you into an exclusive shell.
+    3. AUTO-CLEANUP: When you exit or close the terminal, it automatically unmounts
+       the filesystem and releases the compute node allocation.
     Options:
-      -s, --slurm        Run on an allocated Slurm compute node
-      -g, --gpu          Run on an allocated GPU node
-      -p, --port PORT    Local port to forward to (default: 8888, auto-finds free port)
-      -d, --dir DIR      Remote starting directory
+      -g, --gpu          Allocate a GPU node instead of CPU
+      -b, --browse       Auto-open local file manager (Dolphin/Nautilus) upon mount
+      -c, --cpus NUM     CPU core count (default: ${SLURM_CPUS})
+      -m, --mem MEM      Memory allocation (default: ${SLURM_MEM})
+      -t, --time TIME    Walltime limit (default: ${SLURM_TIME})
+      -p, --partition P  Slurm partition (default: ${SLURM_PARTITION})
+      -q, --qos QOS      Slurm QOS (default: ${SLURM_QOS:-none})
+      -A, --account ACC  Slurm account (default: ${SLURM_ACCOUNT:-none})
 
   cluster shell [OPTIONS]
     Allocate an interactive compute/GPU node and drop directly into an exclusive shell.
     All commands occupy dedicated node CPUs/GPUs until session is closed.
+    Automatically cancels and frees the node when terminal closes.
     Options:
       -g, --gpu          Allocate a GPU node
       -c, --cpus NUM     CPU core count (default: ${SLURM_CPUS})
@@ -104,6 +115,14 @@ Available Commands:
 
   cluster unmount [PATH]
     Safely detach the mounted cluster filesystem.
+
+  cluster jupyter [OPTIONS]
+    Launch remote JupyterLab with automatic port forwarding and browser opening.
+    Options:
+      -s, --slurm        Run on an allocated Slurm compute node
+      -g, --gpu          Run on an allocated GPU node
+      -p, --port PORT    Local port to forward to (default: 8888, auto-finds free port)
+      -d, --dir DIR      Remote starting directory
 
   cluster sync <push|pull> [OPTIONS]
     Fast bi-directional code synchronization via rsync (ignoring .git, caches, venvs).
@@ -125,14 +144,223 @@ Configuration:
   Current Host: ${HOST:-"(not configured yet - set with 'cluster config')"}
 
 Examples:
-  cluster mount -b             # Mount cluster home and open local file manager
-  cluster jupyter              # Fast browser JupyterLab on login node
+  cluster dev -b               # Full workspace: mounts drive + opens Dolphin + compute shell
+  cluster shell --gpu          # Dedicated GPU terminal session (auto-freed on close)
   cluster jupyter --slurm      # Dedicated compute node JupyterLab
-  cluster shell --gpu          # Interactive GPU terminal session
   cluster status               # Check running jobs and node queue status
-  cluster unmount              # Detach mounted drive when done
+  cluster unmount              # Detach mounted drive
 ================================================================================
 EOF
+}
+
+cmd_dev() {
+    require_host
+    if ! command -v sshfs >/dev/null 2>&1; then
+        echo "Error: sshfs is not installed on your system." >&2
+        echo "Install it via your package manager (e.g. sudo pacman -S sshfs)" >&2
+        exit 1
+    fi
+
+    local USE_GPU=false
+    local CPUS="$SLURM_CPUS"
+    local MEM="$SLURM_MEM"
+    local TIME="$SLURM_TIME"
+    local PART="$SLURM_PARTITION"
+    local QOS="$SLURM_QOS"
+    local ACC="$SLURM_ACCOUNT"
+    local LOCAL_MP="$MOUNT_POINT"
+    local REMOTE_DIR=""
+    local OPEN_BROWSER=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -g|--gpu)
+                USE_GPU=true
+                PART="$GPU_PARTITION"
+                QOS="${GPU_QOS:-$QOS}"
+                shift
+                ;;
+            -c|--cpus)
+                CPUS="$2"
+                shift 2
+                ;;
+            -m|--mem)
+                MEM="$2"
+                shift 2
+                ;;
+            -t|--time)
+                TIME="$2"
+                shift 2
+                ;;
+            -p|--partition)
+                PART="$2"
+                shift 2
+                ;;
+            -q|--qos)
+                QOS="$2"
+                shift 2
+                ;;
+            -A|--account)
+                ACC="$2"
+                shift 2
+                ;;
+            -b|--browse)
+                OPEN_BROWSER=true
+                shift
+                ;;
+            --mount)
+                LOCAL_MP="$2"
+                shift 2
+                ;;
+            -d|--dir)
+                REMOTE_DIR="$2"
+                shift 2
+                ;;
+            -H|--host)
+                HOST="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option for dev: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # 1. Mount filesystem
+    mkdir -p "$LOCAL_MP"
+    local MOUNTED_BY_US=false
+    if ! mountpoint -q "$LOCAL_MP"; then
+        echo "Mounting cluster storage to $LOCAL_MP..."
+        sshfs "$HOST:${REMOTE_DIR}" "$LOCAL_MP" \
+            -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user
+        if mountpoint -q "$LOCAL_MP"; then
+            MOUNTED_BY_US=true
+            echo "Drive mounted successfully at $LOCAL_MP"
+        else
+            echo "Warning: Mount did not succeed. Continuing with compute session..." >&2
+        fi
+    else
+        echo "Cluster is already mounted at $LOCAL_MP"
+    fi
+
+    # Set auto-cleanup trap for normal exit, window close (SIGHUP), interrupt (SIGINT), terminate (SIGTERM)
+    cleanup_dev() {
+        trap - EXIT SIGHUP SIGINT SIGTERM
+        echo ""
+        echo "Session ending. Performing automatic cleanup..."
+        if [[ "$MOUNTED_BY_US" == true ]] && mountpoint -q "$LOCAL_MP"; then
+            echo "Unmounting $LOCAL_MP..."
+            if command -v fusermount >/dev/null 2>&1; then
+                fusermount -u -z "$LOCAL_MP" 2>/dev/null || true
+            else
+                umount "$LOCAL_MP" 2>/dev/null || true
+            fi
+            echo "Cleanly unmounted $LOCAL_MP."
+        fi
+        echo "Compute node allocation released."
+    }
+    trap cleanup_dev EXIT SIGHUP SIGINT SIGTERM
+
+    if [[ "$OPEN_BROWSER" == true ]]; then
+        if command -v xdg-open >/dev/null 2>&1; then
+            xdg-open "$LOCAL_MP" >/dev/null 2>&1 &
+        fi
+    fi
+
+    local SLURM_ARGS="-p $PART -c $CPUS --mem=$MEM -t $TIME"
+    [[ -n "$ACC" ]] && SLURM_ARGS="$SLURM_ARGS -A $ACC"
+    [[ -n "$QOS" ]] && SLURM_ARGS="$SLURM_ARGS --qos=$QOS"
+
+    echo "--------------------------------------------------------------------------------"
+    if [[ "$USE_GPU" == true ]]; then
+        SLURM_ARGS="$SLURM_ARGS --gres=gpu:1"
+        echo "Allocating dedicated GPU node ($SLURM_ARGS)..."
+    else
+        echo "Allocating dedicated compute node ($SLURM_ARGS)..."
+    fi
+    echo "Terminal is connected directly to your compute node."
+    echo "Filesystem is live at $LOCAL_MP (copy-paste in Dolphin/Nautilus)."
+    echo "Closing this terminal window or typing 'exit' will automatically"
+    echo "unmount the drive and release the compute node."
+    echo "--------------------------------------------------------------------------------"
+
+    ssh -t "$HOST" "salloc $SLURM_ARGS srun --pty bash -l"
+}
+
+cmd_shell() {
+    require_host
+    local USE_GPU=false
+    local CPUS="$SLURM_CPUS"
+    local MEM="$SLURM_MEM"
+    local TIME="$SLURM_TIME"
+    local PART="$SLURM_PARTITION"
+    local QOS="$SLURM_QOS"
+    local ACC="$SLURM_ACCOUNT"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -g|--gpu)
+                USE_GPU=true
+                PART="$GPU_PARTITION"
+                QOS="${GPU_QOS:-$QOS}"
+                shift
+                ;;
+            -c|--cpus)
+                CPUS="$2"
+                shift 2
+                ;;
+            -m|--mem)
+                MEM="$2"
+                shift 2
+                ;;
+            -t|--time)
+                TIME="$2"
+                shift 2
+                ;;
+            -p|--partition)
+                PART="$2"
+                shift 2
+                ;;
+            -q|--qos)
+                QOS="$2"
+                shift 2
+                ;;
+            -A|--account)
+                ACC="$2"
+                shift 2
+                ;;
+            -H|--host)
+                HOST="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option for shell: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    local SLURM_ARGS="-p $PART -c $CPUS --mem=$MEM -t $TIME"
+    [[ -n "$ACC" ]] && SLURM_ARGS="$SLURM_ARGS -A $ACC"
+    [[ -n "$QOS" ]] && SLURM_ARGS="$SLURM_ARGS --qos=$QOS"
+
+    cleanup_shell() {
+        trap - EXIT SIGHUP SIGINT SIGTERM
+        echo ""
+        echo "Interactive shell closed. Compute node allocation released."
+    }
+    trap cleanup_shell EXIT SIGHUP SIGINT SIGTERM
+
+    if [[ "$USE_GPU" == true ]]; then
+        SLURM_ARGS="$SLURM_ARGS --gres=gpu:1"
+        echo "Requesting dedicated GPU compute node ($SLURM_ARGS)..."
+    else
+        echo "Requesting dedicated compute node ($SLURM_ARGS)..."
+    fi
+
+    echo "Opening interactive shell session. Type 'exit' or close window to release node."
+    ssh -t "$HOST" "salloc $SLURM_ARGS srun --pty bash -l"
 }
 
 cmd_jupyter() {
@@ -216,82 +444,22 @@ cmd_jupyter() {
         EXEC_CMD+=("${EXTRA[@]}")
     fi
 
+    cleanup_jupyter() {
+        trap - EXIT SIGHUP SIGINT SIGTERM
+        echo ""
+        echo "Jupyter session closed. Port forwarding terminated."
+    }
+    trap cleanup_jupyter EXIT SIGHUP SIGINT SIGTERM
+
     echo "Launching JupyterLab via $HOST (port $ACTIVE_PORT)..."
     exec "${EXEC_CMD[@]}"
-}
-
-cmd_shell() {
-    require_host
-    local USE_GPU=false
-    local CPUS="$SLURM_CPUS"
-    local MEM="$SLURM_MEM"
-    local TIME="$SLURM_TIME"
-    local PART="$SLURM_PARTITION"
-    local QOS="$SLURM_QOS"
-    local ACC="$SLURM_ACCOUNT"
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -g|--gpu)
-                USE_GPU=true
-                PART="$GPU_PARTITION"
-                QOS="${GPU_QOS:-$QOS}"
-                shift
-                ;;
-            -c|--cpus)
-                CPUS="$2"
-                shift 2
-                ;;
-            -m|--mem)
-                MEM="$2"
-                shift 2
-                ;;
-            -t|--time)
-                TIME="$2"
-                shift 2
-                ;;
-            -p|--partition)
-                PART="$2"
-                shift 2
-                ;;
-            -q|--qos)
-                QOS="$2"
-                shift 2
-                ;;
-            -A|--account)
-                ACC="$2"
-                shift 2
-                ;;
-            -H|--host)
-                HOST="$2"
-                shift 2
-                ;;
-            *)
-                echo "Unknown option for shell: $1" >&2
-                exit 1
-                ;;
-        esac
-    done
-
-    local SLURM_ARGS="-p $PART -c $CPUS --mem=$MEM -t $TIME"
-    [[ -n "$ACC" ]] && SLURM_ARGS="$SLURM_ARGS -A $ACC"
-    [[ -n "$QOS" ]] && SLURM_ARGS="$SLURM_ARGS --qos=$QOS"
-    if [[ "$USE_GPU" == true ]]; then
-        SLURM_ARGS="$SLURM_ARGS --gres=gpu:1"
-        echo "Requesting dedicated GPU compute node ($SLURM_ARGS)..."
-    else
-        echo "Requesting dedicated compute node ($SLURM_ARGS)..."
-    fi
-
-    echo "Opening interactive shell session. Type 'exit' to release the node when finished."
-    ssh -t "$HOST" "salloc $SLURM_ARGS srun --pty bash -l"
 }
 
 cmd_mount() {
     require_host
     if ! command -v sshfs >/dev/null 2>&1; then
         echo "Error: sshfs is not installed on your system." >&2
-        echo "Install it via your package manager (e.g. sudo pacman -S sshfs / brew install sshfs / sudo apt install sshfs)" >&2
+        echo "Install it via your package manager (e.g. sudo pacman -S sshfs)" >&2
         exit 1
     fi
 
@@ -515,6 +683,9 @@ COMMAND="$1"
 shift
 
 case "$COMMAND" in
+    dev|workspace|session)
+        cmd_dev "$@"
+        ;;
     jupyter|lab|jupyterlab)
         cmd_jupyter "$@"
         ;;
