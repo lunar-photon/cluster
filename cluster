@@ -1,0 +1,553 @@
+#!/usr/bin/env bash
+#
+# cluster - Unified HPC Developer Suite
+# Bridges remote clusters with your local workstation:
+# Jupyter tunneling, interactive compute shells, drive mounting, code syncing, and job monitoring.
+#
+
+set -euo pipefail
+
+VERSION="1.0.0"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cluster"
+CONFIG_FILE="$CONFIG_DIR/config"
+LEGACY_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/cluster-jupyter/config"
+FIRST_RUN_MARKER="$CONFIG_DIR/.first_run_done"
+
+# Load configuration if available
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+elif [[ -f "$LEGACY_CONFIG" ]]; then
+    # shellcheck source=/dev/null
+    source "$LEGACY_CONFIG"
+fi
+
+# Fallback defaults
+HOST="${CLUSTER_HOST:-${HOST:-}}"
+PORT="${CLUSTER_PORT:-${PORT:-8888}}"
+SLURM_PARTITION="${SLURM_PARTITION:-medium}"
+SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
+SLURM_QOS="${SLURM_QOS:-}"
+SLURM_CPUS="${SLURM_CPUS:-4}"
+SLURM_MEM="${SLURM_MEM:-8G}"
+SLURM_TIME="${SLURM_TIME:-04:00:00}"
+GPU_PARTITION="${GPU_PARTITION:-gpu}"
+GPU_QOS="${GPU_QOS:-}"
+MOUNT_POINT="${MOUNT_POINT:-$HOME/Cluster}"
+NOTEBOOK_DIR="${NOTEBOOK_DIR:-}"
+
+# Locate jupyter-forward engine
+find_jupyter_forward() {
+    if [[ -x "$HOME/.venvs/jupyter-forward/bin/jupyter-forward" ]]; then
+        echo "$HOME/.venvs/jupyter-forward/bin/jupyter-forward"
+    elif command -v jupyter-forward >/dev/null 2>&1; then
+        command -v jupyter-forward
+    else
+        echo ""
+    fi
+}
+
+# Find a free local port
+find_free_port() {
+    local p="$1"
+    while nc -z 127.0.0.1 "$p" 2>/dev/null || (ss -tln 2>/dev/null | grep -q ":$p "); do
+        p=$((p + 1))
+    done
+    echo "$p"
+}
+
+# Check that host is defined
+require_host() {
+    if [[ -z "$HOST" ]]; then
+        echo "Error: No cluster host configured." >&2
+        echo "Specify with -H <host>, export CLUSTER_HOST=<host>, or run 'cluster config' to set default HOST." >&2
+        exit 1
+    fi
+}
+
+show_capabilities() {
+    cat << EOF
+================================================================================
+cluster - High-Performance Computing Developer Suite (v${VERSION})
+Bridging remote clusters seamlessly with your local workstation
+================================================================================
+
+Available Commands:
+
+  cluster jupyter [OPTIONS]
+    Launch remote JupyterLab with automatic port forwarding and browser opening.
+    Options:
+      -s, --slurm        Run on an allocated Slurm compute node
+      -g, --gpu          Run on an allocated GPU node
+      -p, --port PORT    Local port to forward to (default: 8888, auto-finds free port)
+      -d, --dir DIR      Remote starting directory
+
+  cluster shell [OPTIONS]
+    Allocate an interactive compute/GPU node and drop directly into an exclusive shell.
+    All commands occupy dedicated node CPUs/GPUs until session is closed.
+    Options:
+      -g, --gpu          Allocate a GPU node
+      -c, --cpus NUM     CPU core count (default: ${SLURM_CPUS})
+      -m, --mem MEM      Memory allocation (default: ${SLURM_MEM})
+      -t, --time TIME    Walltime limit (default: ${SLURM_TIME})
+      -p, --partition P  Slurm partition (default: ${SLURM_PARTITION})
+      -q, --qos QOS      Slurm QOS (default: ${SLURM_QOS:-none})
+      -A, --account ACC  Slurm account (default: ${SLURM_ACCOUNT:-none})
+
+  cluster mount [OPTIONS] [PATH]
+    Mount cluster storage to your local filesystem via SSHFS.
+    Enables native copy-paste (Ctrl+C / Ctrl+V), drag-and-drop, and local editing.
+    Options:
+      -d, --dir DIR      Remote path to mount (default: remote home directory)
+      -m, --mount PATH   Local mount directory (default: ${MOUNT_POINT})
+      -b, --browse       Open file manager (Dolphin/Nautilus) immediately after mounting
+
+  cluster unmount [PATH]
+    Safely detach the mounted cluster filesystem.
+
+  cluster sync <push|pull> [OPTIONS]
+    Fast bi-directional code synchronization via rsync (ignoring .git, caches, venvs).
+    Usage:
+      cluster sync push [LOCAL_DIR] [REMOTE_DIR]
+      cluster sync pull [REMOTE_DIR] [LOCAL_DIR]
+
+  cluster status
+    View live dashboard of your active/queued Slurm jobs, partition queues, and nodes.
+
+  cluster exec [OPTIONS] "<command>"
+    Execute a single command directly inside an allocated Slurm compute node.
+
+  cluster config
+    View or edit your cluster defaults in ${CONFIG_FILE}
+
+Configuration:
+  Stored at: ${CONFIG_FILE}
+  Current Host: ${HOST:-"(not configured yet - set with 'cluster config')"}
+
+Examples:
+  cluster mount -b             # Mount cluster home and open local file manager
+  cluster jupyter              # Fast browser JupyterLab on login node
+  cluster jupyter --slurm      # Dedicated compute node JupyterLab
+  cluster shell --gpu          # Interactive GPU terminal session
+  cluster status               # Check running jobs and node queue status
+  cluster unmount              # Detach mounted drive when done
+================================================================================
+EOF
+}
+
+cmd_jupyter() {
+    require_host
+    local JUPYTER_FORWARD
+    JUPYTER_FORWARD="$(find_jupyter_forward)"
+    if [[ -z "$JUPYTER_FORWARD" ]]; then
+        echo "Error: jupyter-forward engine not found." >&2
+        echo "Run install.sh to set up the virtual environment." >&2
+        exit 1
+    fi
+
+    local LAUNCH_MODE="head"
+    local CUSTOM_CMD=""
+    local J_PORT="$PORT"
+    local J_DIR="$NOTEBOOK_DIR"
+    local EXTRA=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -s|--slurm)
+                LAUNCH_MODE="slurm"
+                shift
+                ;;
+            -g|--gpu)
+                LAUNCH_MODE="gpu"
+                shift
+                ;;
+            -c|--custom)
+                CUSTOM_CMD="$2"
+                shift 2
+                ;;
+            -p|--port)
+                J_PORT="$2"
+                shift 2
+                ;;
+            -d|--dir|--notebook-dir)
+                J_DIR="$2"
+                shift 2
+                ;;
+            -H|--host)
+                HOST="$2"
+                shift 2
+                ;;
+            *)
+                EXTRA+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    local ACTIVE_PORT
+    ACTIVE_PORT="$(find_free_port "$J_PORT")"
+    if [[ "$ACTIVE_PORT" != "$J_PORT" ]]; then
+        echo "Port $J_PORT was busy; selected free port $ACTIVE_PORT"
+    fi
+
+    local EXEC_CMD=("$JUPYTER_FORWARD" "$HOST" "--port" "$ACTIVE_PORT")
+
+    if [[ -n "$CUSTOM_CMD" ]]; then
+        EXEC_CMD+=("--launch-command" "$CUSTOM_CMD")
+    elif [[ "$LAUNCH_MODE" == "slurm" ]]; then
+        local S_CMD="srun -p $SLURM_PARTITION -c $SLURM_CPUS --mem=$SLURM_MEM -t $SLURM_TIME"
+        [[ -n "$SLURM_ACCOUNT" ]] && S_CMD="$S_CMD -A $SLURM_ACCOUNT"
+        [[ -n "$SLURM_QOS" ]] && S_CMD="$S_CMD --qos=$SLURM_QOS"
+        echo "Allocating Slurm compute node: $S_CMD"
+        EXEC_CMD+=("--launch-command" "$S_CMD")
+    elif [[ "$LAUNCH_MODE" == "gpu" ]]; then
+        local G_CMD="srun -p $GPU_PARTITION --gres=gpu:1 -c $SLURM_CPUS --mem=16G -t $SLURM_TIME"
+        [[ -n "$SLURM_ACCOUNT" ]] && G_CMD="$G_CMD -A $SLURM_ACCOUNT"
+        [[ -n "$GPU_QOS" ]] && G_CMD="$G_CMD --qos=$GPU_QOS"
+        echo "Allocating Slurm GPU node: $G_CMD"
+        EXEC_CMD+=("--launch-command" "$G_CMD")
+    fi
+
+    if [[ -n "$J_DIR" ]]; then
+        EXEC_CMD+=("--notebook-dir" "$J_DIR")
+    fi
+
+    if [[ ${#EXTRA[@]} -gt 0 ]]; then
+        EXEC_CMD+=("${EXTRA[@]}")
+    fi
+
+    echo "Launching JupyterLab via $HOST (port $ACTIVE_PORT)..."
+    exec "${EXEC_CMD[@]}"
+}
+
+cmd_shell() {
+    require_host
+    local USE_GPU=false
+    local CPUS="$SLURM_CPUS"
+    local MEM="$SLURM_MEM"
+    local TIME="$SLURM_TIME"
+    local PART="$SLURM_PARTITION"
+    local QOS="$SLURM_QOS"
+    local ACC="$SLURM_ACCOUNT"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -g|--gpu)
+                USE_GPU=true
+                PART="$GPU_PARTITION"
+                QOS="${GPU_QOS:-$QOS}"
+                shift
+                ;;
+            -c|--cpus)
+                CPUS="$2"
+                shift 2
+                ;;
+            -m|--mem)
+                MEM="$2"
+                shift 2
+                ;;
+            -t|--time)
+                TIME="$2"
+                shift 2
+                ;;
+            -p|--partition)
+                PART="$2"
+                shift 2
+                ;;
+            -q|--qos)
+                QOS="$2"
+                shift 2
+                ;;
+            -A|--account)
+                ACC="$2"
+                shift 2
+                ;;
+            -H|--host)
+                HOST="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option for shell: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    local SLURM_ARGS="-p $PART -c $CPUS --mem=$MEM -t $TIME"
+    [[ -n "$ACC" ]] && SLURM_ARGS="$SLURM_ARGS -A $ACC"
+    [[ -n "$QOS" ]] && SLURM_ARGS="$SLURM_ARGS --qos=$QOS"
+    if [[ "$USE_GPU" == true ]]; then
+        SLURM_ARGS="$SLURM_ARGS --gres=gpu:1"
+        echo "Requesting dedicated GPU compute node ($SLURM_ARGS)..."
+    else
+        echo "Requesting dedicated compute node ($SLURM_ARGS)..."
+    fi
+
+    echo "Opening interactive shell session. Type 'exit' to release the node when finished."
+    ssh -t "$HOST" "salloc $SLURM_ARGS srun --pty bash -l"
+}
+
+cmd_mount() {
+    require_host
+    if ! command -v sshfs >/dev/null 2>&1; then
+        echo "Error: sshfs is not installed on your system." >&2
+        echo "Install it via your package manager (e.g. sudo pacman -S sshfs / brew install sshfs / sudo apt install sshfs)" >&2
+        exit 1
+    fi
+
+    local TARGET_DIR=""
+    local LOCAL_MP="$MOUNT_POINT"
+    local OPEN_BROWSER=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--dir)
+                TARGET_DIR="$2"
+                shift 2
+                ;;
+            -m|--mount|--mountpoint)
+                LOCAL_MP="$2"
+                shift 2
+                ;;
+            -b|--browse)
+                OPEN_BROWSER=true
+                shift
+                ;;
+            -H|--host)
+                HOST="$2"
+                shift 2
+                ;;
+            *)
+                LOCAL_MP="$1"
+                shift
+                ;;
+        esac
+    done
+
+    mkdir -p "$LOCAL_MP"
+
+    if mountpoint -q "$LOCAL_MP"; then
+        echo "Cluster is already mounted at $LOCAL_MP"
+    else
+        echo "Mounting $HOST:${TARGET_DIR:-~} to $LOCAL_MP..."
+        sshfs "$HOST:${TARGET_DIR}" "$LOCAL_MP" \
+            -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,idmap=user
+        
+        if mountpoint -q "$LOCAL_MP"; then
+            echo "Successfully mounted to $LOCAL_MP"
+            echo "You can now copy-paste, drag-and-drop, and edit files as a local folder."
+            echo "Run 'cluster unmount' when you are done."
+        else
+            echo "Error: Mount failed." >&2
+            exit 1
+        fi
+    fi
+
+    if [[ "$OPEN_BROWSER" == true ]]; then
+        if command -v xdg-open >/dev/null 2>&1; then
+            xdg-open "$LOCAL_MP" >/dev/null 2>&1 &
+        fi
+    fi
+}
+
+cmd_unmount() {
+    local LOCAL_MP="${1:-$MOUNT_POINT}"
+
+    if ! mountpoint -q "$LOCAL_MP"; then
+        echo "Mount point $LOCAL_MP is not currently mounted."
+        return 0
+    fi
+
+    echo "Unmounting $LOCAL_MP..."
+    if command -v fusermount >/dev/null 2>&1; then
+        fusermount -u -z "$LOCAL_MP"
+    else
+        umount "$LOCAL_MP"
+    fi
+
+    if ! mountpoint -q "$LOCAL_MP"; then
+        echo "Successfully unmounted $LOCAL_MP"
+    else
+        echo "Warning: Mount point still appears active." >&2
+    fi
+}
+
+cmd_sync() {
+    require_host
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: cluster sync <push|pull> [LOCAL_DIR] [REMOTE_DIR]" >&2
+        exit 1
+    fi
+
+    local ACTION="$1"
+    shift
+    local LOCAL_DIR="${1:-.}"
+    local REMOTE_DIR="${2:-}"
+
+    local EXCLUDES=(
+        --exclude=".git/"
+        --exclude="__pycache__/"
+        --exclude="*.pyc"
+        --exclude=".venv/"
+        --exclude="venv/"
+        --exclude="*.log"
+        --exclude=".ipynb_checkpoints/"
+    )
+
+    case "$ACTION" in
+        push)
+            echo "Syncing local ($LOCAL_DIR) -> remote ($HOST:$REMOTE_DIR)..."
+            rsync -avz --progress "${EXCLUDES[@]}" "$LOCAL_DIR/" "$HOST:$REMOTE_DIR/"
+            echo "Push complete."
+            ;;
+        pull)
+            echo "Syncing remote ($HOST:$REMOTE_DIR) -> local ($LOCAL_DIR)..."
+            rsync -avz --progress "${EXCLUDES[@]}" "$HOST:$REMOTE_DIR/" "$LOCAL_DIR/"
+            echo "Pull complete."
+            ;;
+        *)
+            echo "Invalid sync action: $ACTION. Use 'push' or 'pull'." >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_status() {
+    require_host
+    echo "Fetching status from $HOST..."
+    ssh "$HOST" '
+        echo "=== Your Active and Queued Jobs ==="
+        squeue -u "$USER"
+        echo ""
+        echo "=== Cluster Partition and Node Availability ==="
+        sinfo
+    '
+}
+
+cmd_exec() {
+    require_host
+    if [[ $# -lt 1 ]]; then
+        echo "Usage: cluster exec [OPTIONS] \"<command>\"" >&2
+        exit 1
+    fi
+
+    local CPUS="$SLURM_CPUS"
+    local MEM="$SLURM_MEM"
+    local TIME="$SLURM_TIME"
+    local PART="$SLURM_PARTITION"
+    local QOS="$SLURM_QOS"
+    local ACC="$SLURM_ACCOUNT"
+    local COMMAND=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--cpus) CPUS="$2"; shift 2 ;;
+            -m|--mem) MEM="$2"; shift 2 ;;
+            -t|--time) TIME="$2"; shift 2 ;;
+            -p|--partition) PART="$2"; shift 2 ;;
+            -q|--qos) QOS="$2"; shift 2 ;;
+            -A|--account) ACC="$2"; shift 2 ;;
+            *) COMMAND="$1"; shift ;;
+        esac
+    done
+
+    local SLURM_ARGS="-p $PART -c $CPUS --mem=$MEM -t $TIME"
+    [[ -n "$ACC" ]] && SLURM_ARGS="$SLURM_ARGS -A $ACC"
+    [[ -n "$QOS" ]] && SLURM_ARGS="$SLURM_ARGS --qos=$QOS"
+
+    echo "Dispatching execution to compute node ($SLURM_ARGS)..."
+    ssh "$HOST" "srun $SLURM_ARGS bash -lc \"$COMMAND\""
+}
+
+cmd_config() {
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo "No config file found. Creating template at $CONFIG_FILE..."
+        cat << 'EOF' > "$CONFIG_FILE"
+# cluster configuration file
+HOST="cluster.university.edu"
+PORT=8888
+SLURM_PARTITION="medium"
+SLURM_ACCOUNT=""
+SLURM_QOS=""
+SLURM_CPUS=4
+SLURM_MEM="8G"
+SLURM_TIME="04:00:00"
+GPU_PARTITION="gpu"
+GPU_QOS=""
+MOUNT_POINT="$HOME/Cluster"
+NOTEBOOK_DIR=""
+EOF
+    fi
+
+    if [[ -n "${EDITOR:-}" ]]; then
+        "$EDITOR" "$CONFIG_FILE"
+    else
+        echo "Current configuration (${CONFIG_FILE}):"
+        echo "----------------------------------------"
+        cat "$CONFIG_FILE"
+        echo "----------------------------------------"
+        echo "To edit, open this file in your editor or run: nano ${CONFIG_FILE}"
+    fi
+}
+
+# First run detection
+check_first_run() {
+    if [[ ! -f "$FIRST_RUN_MARKER" ]]; then
+        mkdir -p "$CONFIG_DIR"
+        touch "$FIRST_RUN_MARKER"
+        echo ""
+        echo "Welcome to cluster! Initial setup detected."
+        echo ""
+        show_capabilities
+        exit 0
+    fi
+}
+
+# Main Entry Point
+if [[ $# -eq 0 ]]; then
+    check_first_run
+    show_capabilities
+    exit 0
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+    jupyter|lab|jupyterlab)
+        cmd_jupyter "$@"
+        ;;
+    shell|interactive|sh)
+        cmd_shell "$@"
+        ;;
+    mount)
+        cmd_mount "$@"
+        ;;
+    unmount|umount)
+        cmd_unmount "$@"
+        ;;
+    sync)
+        cmd_sync "$@"
+        ;;
+    status|stat|queue|q)
+        cmd_status "$@"
+        ;;
+    exec|run)
+        cmd_exec "$@"
+        ;;
+    config|cfg)
+        cmd_config "$@"
+        ;;
+    -h|--help|help)
+        show_capabilities
+        ;;
+    -v|--version|version)
+        echo "cluster version ${VERSION}"
+        ;;
+    *)
+        echo "Unknown command: $COMMAND" >&2
+        echo "Run 'cluster --help' to see all available commands." >&2
+        exit 1
+        ;;
+esac

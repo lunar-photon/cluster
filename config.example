@@ -1,22 +1,26 @@
-# cluster-jupyter configuration file
-# Place this at ~/.config/cluster-jupyter/config to set your default cluster preferences.
+# cluster configuration file
+# Place this at ~/.config/cluster/config to set your default cluster preferences.
 
 # Cluster SSH host (hostname or ~/.ssh/config Host alias)
 HOST="your-cluster.example.edu"
 
-# Default local port (will auto-increment if in use)
+# Default local port for JupyterLab (will auto-increment if in use)
 PORT=8888
 
-# Default Slurm parameters (used with --slurm)
+# Default Slurm parameters (used with 'cluster shell' and 'cluster jupyter --slurm')
 SLURM_PARTITION="medium"
 SLURM_ACCOUNT=""
 SLURM_QOS=""
 SLURM_CPUS=4
 SLURM_MEM="8G"
+SLURM_TIME="04:00:00"
 
 # Default GPU parameters (used with --gpu)
 GPU_PARTITION="gpu"
 GPU_QOS=""
+
+# Default local mount point for 'cluster mount'
+MOUNT_POINT="$HOME/Cluster"
 
 # Default remote notebook starting directory
 NOTEBOOK_DIR=""

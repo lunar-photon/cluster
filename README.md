@@ -1,18 +1,24 @@
-# cluster-jupyter
+# cluster
 
-Seamlessly launch remote JupyterLab sessions on an HPC cluster and automatically tunnel them into your local web browser.
+A unified High-Performance Computing (HPC) developer suite bridging remote Slurm/OpenHPC clusters with your local workstation.
 
-cluster-jupyter automates remote Jupyter execution on Slurm and OpenHPC clusters. It eliminates manual port forwarding, SSH tunnel setups, token copy-pasting, and batch job script boilerplate.
+cluster turns remote HPC infrastructure into an intuitive extension of your laptop:
+- Launch remote JupyterLab sessions with automatic port tunneling and browser opening.
+- Mount cluster storage locally so you can copy-paste files, drag-and-drop datasets, and edit code natively in local editors.
+- Borrow dedicated compute or GPU nodes interactively to run code instantly without waiting for batch job output logs.
+- Synchronize project code bi-directionally in milliseconds.
+- Monitor active Slurm queues, running jobs, and partition availability from your local terminal.
 
 ---
 
 ## Features
 
-- Zero-configuration tunneling: Finds free ports on your local machine and forwards the remote session automatically.
-- Automatic browser launch: Extracts the Jupyter authentication token and opens your default browser immediately.
-- Interactive Slurm integration: Allocate compute nodes or GPU resources with simple flags (--slurm, --gpu) without writing job scripts.
-- Configurable defaults: Store frequently used cluster hosts, partitions, and allocations in a local config file (~/.config/cluster-jupyter/config).
-- Headless cluster support: Works on standard SSH-accessible clusters without requiring administrative web portals (such as Open OnDemand or JupyterHub).
+- Interactive Compute Shells: Jump directly into a dedicated Slurm node (CPU or GPU) with an exclusive bash prompt. Code runs and occupies resources interactively until you close the session.
+- Seamless Local Drive Mount: Uses SSHFS to mount your cluster home directly into your local file manager (Dolphin / Nautilus). Copy, paste, and view plots without manual downloads.
+- Automated Jupyter Tunneling: Auto-discovers free ports, sets up secure multi-hop SSH tunnels, extracts session tokens, and launches your default browser.
+- Smart Code Synchronization: Push and pull codebase changes rapidly with rsync, automatically ignoring heavy artifacts (.git, virtualenvs, __pycache__, checkpoints).
+- Instant Status Dashboard: View your queued jobs, remaining allocation runtimes, and cluster partition health in real time.
+- Configurable Defaults: Store frequent settings (cluster host, Slurm accounts, default partitions) in ~/.config/cluster/config.
 
 ---
 
@@ -22,11 +28,13 @@ cluster-jupyter automates remote Jupyter execution on Slurm and OpenHPC clusters
 - Linux or macOS
 - Python 3.8+
 - OpenSSH client
-- jupyter-forward (automatically installed by install.sh)
+- sshfs (for drive mounting)
+- rsync (for code syncing)
 
 ### Remote Cluster
 - SSH access (configured in ~/.ssh/config or via key authentication)
-- JupyterLab installed on the cluster (e.g. via Anaconda or module load anaconda3)
+- Slurm job scheduler (for compute node allocations and status checks)
+- JupyterLab installed (for Jupyter tunneling)
 
 ---
 
@@ -35,13 +43,13 @@ cluster-jupyter automates remote Jupyter execution on Slurm and OpenHPC clusters
 Clone this repository and run the installer:
 
 ```bash
-git clone https://github.com/lunar-photon/cluster-jupyter.git
-cd cluster-jupyter
+git clone https://github.com/lunar-photon/cluster.git
+cd cluster
 chmod +x install.sh
 ./install.sh
 ```
 
-Ensure `~/.local/bin` is in your PATH. If it is not, add the following to your `~/.bashrc` or `~/.zshrc`:
+Ensure `~/.local/bin` is in your PATH. If not, add the following to your `~/.bashrc` or `~/.zshrc`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -49,100 +57,139 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ---
 
-## Configuration
+## First Run and Configuration
 
-You can define your default cluster host and Slurm settings so you do not have to type them every time.
-
-Copy the example configuration:
+When you run `cluster` for the first time without arguments:
 
 ```bash
-mkdir -p ~/.config/cluster-jupyter
-cp config.example ~/.config/cluster-jupyter/config
+cluster
 ```
 
-Edit `~/.config/cluster-jupyter/config`:
+It welcomes you and prints a full capability guide with examples.
+
+### Setting Up Your Cluster Profile
+
+Copy the template configuration to your user config directory:
 
 ```bash
-# Cluster SSH host (hostname or ~/.ssh/config Host alias)
+mkdir -p ~/.config/cluster
+cp config.example ~/.config/cluster/config
+```
+
+Edit `~/.config/cluster/config`:
+
+```bash
+# Cluster SSH host (hostname or ~/.ssh/config alias)
 HOST="cluster.university.edu"
 
-# Default local port (will auto-increment if in use)
+# Default local port for JupyterLab
 PORT=8888
 
-# Slurm parameters for --slurm
+# Default Slurm compute settings
 SLURM_PARTITION="medium"
 SLURM_ACCOUNT="myaccount"
-SLURM_QOS="myqos"
+SLURM_QOS="standard_qos"
 SLURM_CPUS=4
 SLURM_MEM="8G"
+SLURM_TIME="04:00:00"
 
-# Slurm parameters for --gpu
+# Slurm GPU settings
 GPU_PARTITION="gpu"
 GPU_QOS="gpu_qos"
+
+# Local mount directory
+MOUNT_POINT="$HOME/Cluster"
 ```
 
 ---
 
-## Usage
+## Commands and Usage
 
-### 1. Head Node Launch
-Connect to your saved default cluster host and start JupyterLab instantly:
+### 1. Interactive Compute Shell (`cluster shell`)
+Borrow an exclusive compute node for interactive coding, testing, and debugging:
 
 ```bash
-cluster-jupyter
+# Request standard compute node (uses your config defaults: 4 CPUs, 8GB RAM)
+cluster shell
+
+# Request a dedicated GPU node
+cluster shell --gpu
+
+# Customize resource request on the fly
+cluster shell -c 8 -m 32G -t 02:00:00
+```
+This drops you straight into a terminal prompt running on the compute node (e.g., node18). Run python scripts, simulations, or tests directly. Type `exit` when done to release the node.
+
+### 2. Local Storage Mount (`cluster mount` / `cluster unmount`)
+Mount remote cluster files directly into your local filesystem:
+
+```bash
+# Mount remote home directory to ~/Cluster and open your file manager
+cluster mount -b
+
+# Detach the mount cleanly when finished
+cluster unmount
+```
+Once mounted, you can copy-paste files using standard keyboard shortcuts (Ctrl+C / Ctrl+V), drag-and-drop datasets, or open generated figures directly in your local PDF/image viewer.
+
+### 3. Remote JupyterLab (`cluster jupyter`)
+Launch a full visual JupyterLab session with zero manual port management:
+
+```bash
+# Instant launch on head node
+cluster jupyter
+
+# Dedicated Slurm compute node launch
+cluster jupyter --slurm
+
+# Dedicated Slurm GPU node launch
+cluster jupyter --gpu
+
+# Start in a specific directory
+cluster jupyter -d ~/projects/cosmology
 ```
 
-Or specify a different host directly:
+### 4. Fast Code Sync (`cluster sync`)
+Synchronize local code changes to the cluster without copying huge caches or git history:
 
 ```bash
-cluster-jupyter -H mycluster.university.edu
+# Push current local folder to remote directory
+cluster sync push . ~/projects/mycode
+
+# Pull remote changes back to local machine
+cluster sync pull ~/projects/mycode .
 ```
 
-### 2. Slurm Compute Node Allocation
-Allocate a compute node via Slurm and launch JupyterLab inside the job:
+### 5. Cluster Status Dashboard (`cluster status`)
+Check your job queue and cluster health instantly from your local terminal:
 
 ```bash
-cluster-jupyter --slurm
+cluster status
 ```
 
-### 3. Slurm GPU Node Allocation
-Allocate a GPU node and launch JupyterLab:
+### 6. One-off Compute Execution (`cluster exec`)
+Dispatch a single command to an allocated compute node without writing a job submission script:
 
 ```bash
-cluster-jupyter --gpu
-```
-
-### 4. Custom Notebook Directory
-Open directly into a specific project folder on the cluster:
-
-```bash
-cluster-jupyter -d ~/projects/cosmology_runs
-```
-
-### 5. Custom Slurm Flags
-Pass arbitrary srun / sbatch commands:
-
-```bash
-cluster-jupyter -c "srun -p test -c 8 --mem=16G -t 02:00:00"
+cluster exec --cpus 8 "python train.py --epochs 50"
 ```
 
 ---
 
-## Command Line Options
+## Command Reference
 
 ```text
-Usage: cluster-jupyter [OPTIONS]
+Usage: cluster <command> [OPTIONS]
 
-Options:
-  -H, --host HOST        Cluster SSH host or ~/.ssh/config alias
-  -s, --slurm            Launch inside a Slurm CPU allocation
-  -g, --gpu              Launch inside a Slurm GPU allocation
-  -A, --account ACCT     Slurm project/account name
-  -q, --qos QOS          Slurm Quality of Service (QOS)
-  -p, --port PORT        Local port to forward to (default: 8888, auto-increments if busy)
-  -d, --dir DIR          Starting directory for Jupyter notebooks on remote host
-  -c, --custom "CMD"     Custom launch command (overrides automatic srun flags)
-  -h, --help             Show this help message and exit
+Commands:
+  jupyter [OPTIONS]       Launch remote JupyterLab with automated tunneling
+  shell [OPTIONS]         Allocate an interactive compute/GPU shell
+  mount [OPTIONS]         Mount cluster filesystem locally via SSHFS
+  unmount                 Safely unmount the local cluster drive
+  sync <push|pull>        Fast bi-directional code sync via rsync
+  status                  View active Slurm jobs, queues, and node availability
+  exec "<command>"        Run a command directly inside an allocated compute node
+  config                  View or edit your local cluster configuration
 ```
 
 ---

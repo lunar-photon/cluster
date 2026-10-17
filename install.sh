@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# install.sh - Installer for cluster-jupyter
+# install.sh - Installer for cluster
 #
 
 set -euo pipefail
 
 INSTALL_DIR="${HOME}/.local/bin"
 VENV_DIR="${HOME}/.venvs/jupyter-forward"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cluster-jupyter"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cluster"
 
-echo "Installing cluster-jupyter..."
+echo "Installing cluster suite..."
 
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$CONFIG_DIR"
@@ -22,8 +22,15 @@ if ! command -v jupyter-forward >/dev/null 2>&1 && [[ ! -x "$VENV_DIR/bin/jupyte
     "$VENV_DIR/bin/pip" install jupyter-forward
 fi
 
-# Copy cluster-jupyter script
-cp -f "$(dirname "$0")/cluster-jupyter" "$INSTALL_DIR/cluster-jupyter"
+# Copy cluster script
+cp -f "$(dirname "$0")/cluster" "$INSTALL_DIR/cluster"
+chmod +x "$INSTALL_DIR/cluster"
+
+# Create cluster-jupyter backward compatibility wrapper
+cat << 'EOF' > "$INSTALL_DIR/cluster-jupyter"
+#!/usr/bin/env bash
+exec cluster jupyter "$@"
+EOF
 chmod +x "$INSTALL_DIR/cluster-jupyter"
 
 # Copy example config if none exists
@@ -35,4 +42,4 @@ fi
 
 echo "Installation complete!"
 echo "Make sure $INSTALL_DIR is in your PATH."
-echo "Run 'cluster-jupyter --help' to get started."
+echo "Run 'cluster' to get started."
