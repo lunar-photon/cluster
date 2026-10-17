@@ -3,6 +3,13 @@ config
 .env
 *.local
 
+# Build artifacts
+build/
+bin/
+*.o
+*.a
+*.so
+
 # Logs and runtime files
 *.log
 .jupyter_forward/

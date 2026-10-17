@@ -660,26 +660,20 @@ EOF
 }
 
 launch_tui() {
-    local PYTHON=""
-    if [[ -x "$HOME/.venvs/jupyter-forward/bin/python" ]]; then
-        PYTHON="$HOME/.venvs/jupyter-forward/bin/python"
-    elif command -v python3 >/dev/null 2>&1; then
-        PYTHON="python3"
-    fi
-
+    local TUI_BIN=""
     local SCRIPT_DIR
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local TUI_SCRIPT=""
-    if [[ -f "$SCRIPT_DIR/cluster_tui.py" ]]; then
-        TUI_SCRIPT="$SCRIPT_DIR/cluster_tui.py"
-    elif [[ -f "$HOME/.local/bin/cluster_tui.py" ]]; then
-        TUI_SCRIPT="$HOME/.local/bin/cluster_tui.py"
-    elif [[ -f "$HOME/Downloads/cluster/cluster_tui.py" ]]; then
-        TUI_SCRIPT="$HOME/Downloads/cluster/cluster_tui.py"
+
+    if [[ -x "$HOME/.local/bin/cluster-tui" ]]; then
+        TUI_BIN="$HOME/.local/bin/cluster-tui"
+    elif [[ -x "$SCRIPT_DIR/build/cluster-tui" ]]; then
+        TUI_BIN="$SCRIPT_DIR/build/cluster-tui"
+    elif command -v cluster-tui >/dev/null 2>&1; then
+        TUI_BIN="$(command -v cluster-tui)"
     fi
 
-    if [[ -n "$PYTHON" && -n "$TUI_SCRIPT" ]] && "$PYTHON" -c "import textual" >/dev/null 2>&1; then
-        exec "$PYTHON" "$TUI_SCRIPT" "$@"
+    if [[ -n "$TUI_BIN" && -x "$TUI_BIN" ]]; then
+        exec "$TUI_BIN" "$@"
     else
         show_capabilities
     fi

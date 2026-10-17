@@ -1,9 +1,9 @@
 # cluster
 
-A unified High-Performance Computing (HPC) developer suite and interactive Terminal User Interface (TUI) bridging remote Slurm/OpenHPC clusters with your local workstation.
+A unified High-Performance Computing (HPC) developer suite with a native C++ Terminal User Interface (TUI) bridging remote Slurm/OpenHPC clusters with your local workstation.
 
 cluster turns remote HPC infrastructure into an intuitive extension of your laptop:
-- Modern Interactive TUI Dashboard: Browse, launch, monitor, and configure cluster tools with a responsive keyboard- and mouse-driven terminal interface.
+- Fast Native C++ TUI Dashboard: Built with modern C++17 and FTXUI into a standalone, lightweight, high-performance binary.
 - Complete Workspace Mode (`cluster dev`): Mounts cluster storage locally, opens Dolphin, and connects an interactive compute or GPU shell. When you close the terminal or type exit, it automatically unmounts the drive and frees the compute node.
 - Interactive Compute Shells (`cluster shell`): Jump directly into a dedicated Slurm node (CPU or GPU) with an exclusive bash prompt. Code runs and occupies resources interactively until you close the session.
 - Seamless Local Drive Mount (`cluster mount` / `cluster unmount`): Uses SSHFS to mount your cluster home directly into your local file manager. Copy, paste, and view plots without manual downloads.
@@ -13,9 +13,9 @@ cluster turns remote HPC infrastructure into an intuitive extension of your lapt
 
 ---
 
-## Interactive TUI Application
+## Native C++ TUI Application
 
-Simply running `cluster` in any terminal opens the full-screen interactive TUI dashboard:
+Running `cluster` in any terminal opens the full-screen interactive C++ TUI dashboard:
 
 ```bash
 cluster
@@ -28,13 +28,13 @@ cluster
 - Cluster Monitor: Live tables displaying your active/queued Slurm jobs and cluster partition availability (`short`, `medium`, `gpu`) with an instant Refresh button.
 - Visual Settings Editor: Configure your cluster host, Slurm accounts, partitions, CPU counts, memory limits, and mount directories without touching config files manually.
 - Keyboard Shortcuts:
-  - `q`: Quit TUI
+  - `q` / `Esc`: Quit TUI
   - `r`: Refresh cluster status
   - `d`: Launch Dev Workspace
   - `j`: Launch JupyterLab
   - `m`: Toggle drive mount
 
-When you launch an action from the TUI, the interface smoothly suspends and hands over full terminal control to your interactive compute session or Jupyter session. When you exit, the dashboard automatically re-appears with updated states.
+When you launch an action from the TUI, the interface smoothly restores terminal I/O and hands over full control to your interactive compute session or Jupyter session. When you exit, the dashboard automatically re-appears with updated states.
 
 ---
 
@@ -42,12 +42,11 @@ When you launch an action from the TUI, the interface smoothly suspends and hand
 
 ### Local Machine
 - Linux or macOS
-- Python 3.8+
+- C++17 compiler (GCC 9+ or Clang 10+)
+- CMake 3.16+
 - OpenSSH client
 - sshfs (for drive mounting)
 - rsync (for code syncing)
-- textual (installed automatically by install.sh)
-- jupyter-forward (installed automatically by install.sh)
 
 ### Remote Cluster
 - SSH access (configured in ~/.ssh/config or via key authentication)
@@ -56,15 +55,21 @@ When you launch an action from the TUI, the interface smoothly suspends and hand
 
 ---
 
-## Installation
+## Installation & Building from Source
 
 Clone this repository and run the installer:
 
 ```bash
 git clone https://github.com/lunar-photon/cluster.git
 cd cluster
-chmod +x install.sh
 ./install.sh
+```
+
+Or build manually with Make:
+
+```bash
+make
+sudo make install # Or ./install.sh for user local install in ~/.local/bin
 ```
 
 Ensure `~/.local/bin` is in your PATH. If not, add the following to your `~/.bashrc` or `~/.zshrc`:
@@ -146,7 +151,7 @@ cluster exec --cpus 8 "python train.py --epochs 50"
 Usage: cluster [command] [OPTIONS]
 
 Commands:
-  tui                     Open the full-screen interactive TUI dashboard (default when no args)
+  tui                     Open the native C++ TUI dashboard (default when no args)
   dev [OPTIONS]           All-in-one workspace (mount + compute shell + auto-cleanup)
   shell [OPTIONS]         Allocate an interactive compute/GPU shell (auto-freed on close)
   mount [OPTIONS]         Mount cluster filesystem locally via SSHFS
