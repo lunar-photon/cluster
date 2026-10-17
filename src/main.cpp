@@ -4,6 +4,7 @@
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/dom/table.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -201,12 +203,26 @@ int main() {
         }
     };
 
+    std::atomic<bool> is_refreshing{false};
+    auto trigger_refresh = [&]() {
+        if (is_refreshing) return;
+        is_refreshing = true;
+        feedback_msg = "Refreshing status...";
+        screen.PostEvent(Event::Custom);
+        std::thread([&] {
+            refresh_monitor();
+            is_refreshing = false;
+            feedback_msg = "";
+            screen.PostEvent(Event::Custom);
+        }).detach();
+    };
+
     // Run external command with terminal I/O restored
     auto exec_command = [&](const std::string& cmd) {
         screen.WithRestoredIO([&] {
             std::system(cmd.c_str());
         })();
-        refresh_monitor();
+        trigger_refresh();
     };
 
     // Tab 1: Actions Buttons
@@ -226,16 +242,19 @@ int main() {
     auto btn_sync_push = Button("Push Code -> Cluster", [&] { exec_command("cluster sync push"); });
     auto btn_sync_pull = Button("Pull Code <- Cluster", [&] { exec_command("cluster sync pull"); });
 
+    auto btn_quit = Button("Quit [q]", [&] { screen.Exit(); });
+
     auto actions_container = Container::Vertical({
         Container::Horizontal({btn_dev_cpu, btn_dev_gpu}),
         Container::Horizontal({btn_shell_cpu, btn_shell_gpu}),
         Container::Horizontal({btn_jup_head, btn_jup_slurm, btn_jup_gpu}),
         Container::Horizontal({btn_mount, btn_unmount}),
-        Container::Horizontal({btn_sync_push, btn_sync_pull})
+        Container::Horizontal({btn_sync_push, btn_sync_pull}),
+        Container::Horizontal({btn_quit})
     });
 
     // Tab 2: Monitor
-    auto btn_refresh = Button("Refresh Status", [&] { refresh_monitor(); });
+    auto btn_refresh = Button("Refresh Status", [&] { trigger_refresh(); });
     auto monitor_container = Container::Vertical({
         btn_refresh
     });
@@ -300,12 +319,12 @@ int main() {
 
     // Catch keyboard shortcuts
     auto main_with_events = CatchEvent(main_container, [&](Event event) {
-        if (event == Event::Character('q') || event == Event::Escape) {
-            screen.ExitLoopClosure()();
+        if (event == Event::Character('q') || event == Event::Character('Q') || event == Event::Escape) {
+            screen.Exit();
             return true;
         }
         if (event == Event::Character('r')) {
-            refresh_monitor();
+            trigger_refresh();
             return true;
         }
         if (event == Event::Character('d')) {
@@ -377,7 +396,13 @@ int main() {
                     text("Mount cluster storage for local copy-pasting (Ctrl+C/V), or sync directories with rsync.") | color(Color::GrayLight),
                     separator(),
                     hbox({btn_mount->Render(), btn_unmount->Render(), btn_sync_push->Render(), btn_sync_pull->Render()})
-                }) | border
+                }) | border,
+
+                hbox({
+                    btn_quit->Render(),
+                    filler(),
+                    text("Press [q] or [Esc] to exit dashboard") | color(Color::GrayLight)
+                })
             });
         } else if (selected_tab == 1) {
             // Cluster Monitor
@@ -440,8 +465,8 @@ int main() {
         });
     });
 
-    // Initial monitor fetch
-    refresh_monitor();
+    // Initial async monitor fetch
+    trigger_refresh();
 
     screen.Loop(renderer);
     return 0;

@@ -679,23 +679,8 @@ launch_tui() {
     fi
 }
 
-# First run detection
-check_first_run() {
-    if [[ ! -f "$FIRST_RUN_MARKER" ]]; then
-        mkdir -p "$CONFIG_DIR"
-        touch "$FIRST_RUN_MARKER"
-        echo ""
-        echo "Welcome to cluster! Initial setup detected."
-        echo ""
-        show_capabilities
-        echo ""
-        read -r -p "Press Enter to start the cluster TUI dashboard..." || true
-    fi
-}
-
 # Main Entry Point
 if [[ $# -eq 0 ]]; then
-    check_first_run
     if [[ -t 0 && -t 1 ]]; then
         launch_tui
     else
