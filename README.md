@@ -1,170 +1,106 @@
 # cluster
 
-A unified High-Performance Computing (HPC) developer suite with a native C++ Terminal User Interface (TUI) bridging remote Slurm/OpenHPC clusters with your local workstation.
+`cluster` lets you work on a Slurm cluster from your laptop. It opens shells on compute nodes, mounts cluster storage in your file manager, runs JupyterLab on a compute node with a tunnel to your browser, syncs code with rsync, and shows your queue in a terminal dashboard.
 
-cluster turns remote HPC infrastructure into an intuitive extension of your laptop:
-- Fast Native C++ TUI Dashboard: Built with modern C++17 and FTXUI into a standalone, lightweight, high-performance binary.
-- Complete Workspace Mode (`cluster dev`): Mounts cluster storage locally, opens Dolphin, and connects an interactive compute or GPU shell. When you close the terminal or type exit, it automatically unmounts the drive and frees the compute node.
-- Interactive Compute Shells (`cluster shell`): Jump directly into a dedicated Slurm node (CPU or GPU) with an exclusive bash prompt. Code runs and occupies resources interactively until you close the session.
-- Seamless Local Drive Mount (`cluster mount` / `cluster unmount`): Uses SSHFS to mount your cluster home directly into your local file manager. Copy, paste, and view plots without manual downloads.
-- Automated Jupyter Tunneling (`cluster jupyter`): Auto-discovers free ports, sets up secure multi-hop SSH tunnels, extracts session tokens, and launches your default browser.
-- Smart Code Synchronization (`cluster sync`): Push and pull codebase changes rapidly with rsync, automatically ignoring heavy artifacts (.git, virtualenvs, __pycache__, checkpoints).
-- Live Cluster Monitor: Real-time Slurm job queue inspection and partition availability tables built right into the TUI and CLI.
+It is a single Go binary with no runtime dependencies beyond OpenSSH. Mounting needs `sshfs` and syncing needs `rsync`.
 
----
-
-## Native C++ TUI Application
-
-Running `cluster` in any terminal opens the full-screen interactive C++ TUI dashboard:
-
-```bash
-cluster
-```
-
-(Or explicitly with `cluster tui`).
-
-### What You Can Do in the TUI:
-- Workspace & Actions: One-click buttons to launch Dev Workspaces (CPU/GPU), interactive shells, JupyterLab instances, toggle local drive mounts, and sync files.
-- Cluster Monitor: Live tables displaying your active/queued Slurm jobs and cluster partition availability (`short`, `medium`, `gpu`) with an instant Refresh button.
-- Visual Settings Editor: Configure your cluster host, Slurm accounts, partitions, CPU counts, memory limits, and mount directories without touching config files manually.
-- Keyboard Shortcuts:
-  - `q` / `Esc`: Quit TUI
-  - `r`: Refresh cluster status
-  - `d`: Launch Dev Workspace
-  - `j`: Launch JupyterLab
-  - `m`: Toggle drive mount
-
-When you launch an action from the TUI, the interface smoothly restores terminal I/O and hands over full control to your interactive compute session or Jupyter session. When you exit, the dashboard automatically re-appears with updated states.
-
----
-
-## Requirements
-
-### Local Machine
-- Linux or macOS
-- C++17 compiler (GCC 9+ or Clang 10+)
-- CMake 3.16+
-- OpenSSH client
-- sshfs (for drive mounting)
-- rsync (for code syncing)
-
-### Remote Cluster
-- SSH access (configured in ~/.ssh/config or via key authentication)
-- Slurm job scheduler (for compute node allocations and status checks)
-- JupyterLab installed (for Jupyter tunneling)
-
----
-
-## Installation & Building from Source
-
-Clone this repository and run the installer:
+## Install
 
 ```bash
 git clone https://github.com/lunar-photon/cluster.git
 cd cluster
-./install.sh
+./install.sh          # builds with Go 1.23+ and installs ~/.local/bin/cluster
+cluster init          # asks the cluster which accounts, QOS and partitions you can use
 ```
 
-Or build manually with Make:
+`make dist` builds static binaries for Linux and macOS (amd64 and arm64).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `cluster` | Opens the dashboard (when run in a terminal) |
+| `cluster shell [-g]` | Allocates a node (`-g`: GPU node) and opens a shell on it |
+| `cluster dev [-g] [-b]` | Mounts storage, then opens a shell. `-b` opens the mount in your file manager |
+| `cluster jupyter [-g \| --head]` | JupyterLab on a compute node (or the login node), opened in your browser |
+| `cluster attach [JOBID]` | Reconnects to a running session |
+| `cluster ps` | Lists sessions this tool started and whether they are still running |
+| `cluster stop JOBID \| --all` | Cancels the job, closes tunnels, unmounts |
+| `cluster gc` | Cleans up ended sessions and lists leftover `cluster:*` jobs |
+| `cluster mount` / `unmount` | Mounts storage with sshfs until you unmount it |
+| `cluster sync push\|pull [LOCAL] [REMOTE]` | rsync, skipping `.git`, venvs and caches |
+| `cluster exec CMD...` | Runs one command on a compute node with `srun` |
+| `cluster status` | Shows your jobs and partition availability |
+| `cluster config [show\|migrate]` | Edits, prints or converts the config |
+
+Every command accepts `--dry-run` (`-n`), which prints the ssh, sbatch, rsync and sshfs commands instead of running them. Allocation flags are shared: `-P profile`, `-p partition`, `-A account`, `-q qos`, `-c cpus`, `-m mem`, `-t time`, `--gpus N`.
+
+## Sessions and network drops
+
+`shell`, `dev` and `jupyter` submit a placeholder batch job and record its ID in `~/.local/state/cluster/sessions.json` before doing anything else. What happens next depends on how the session ends:
+
+- **You type `exit` or close the terminal.** The job is cancelled with `scancel`, and the tool waits until Slurm stops listing it. Anything the session mounted is unmounted, unless another running session still uses the mount.
+- **The network drops.** SSH keepalives tolerate about 45 seconds of silence, so a short outage does not disconnect you. After a longer one, the job keeps running, and `cluster` retries with backoff until the cluster is reachable, then reattaches. Press Ctrl+C to stop retrying; the job stays up and `cluster attach` resumes it later.
+- **You detach from tmux (Ctrl+b d).** The job keeps running. Use `cluster attach` to come back or `cluster stop` to release it.
+
+If tmux is installed on the cluster, the shell runs inside a tmux session started by the batch job, so reattaching after a drop returns you to the same shell with your programs still running. Without tmux, a reattach opens a new shell on the same node, and programs started in the old shell will have received SIGHUP. Pass `--no-tmux` to opt out.
+
+Jupyter runs as its own job, so kernels survive a drop and only the local tunnel restarts. Ctrl+C in the `cluster jupyter` terminal stops the server and releases the node. The token is passed to Jupyter in the environment and never appears on a command line that other users could see with `ps`.
+
+All ssh, rsync and sshfs calls share one OpenSSH connection (`ControlMaster`). A password or 2FA prompt appears once, and later commands reuse the login for 10 minutes after their last use. The Jupyter tunnel uses its own connection, so on password-only clusters it asks again.
+
+## Configuration
+
+`~/.config/cluster/config.toml` (run `cluster config` to edit it):
+
+```toml
+host = "hpc.example.edu"        # or a Host alias from ~/.ssh/config
+mount_point = "~/Cluster"
+default_profile = "cpu"
+
+[slurm]                         # defaults shared by every profile
+partition = "medium"
+account = "mylab"
+cpus = 4
+mem = "8G"
+time = "04:00:00"
+
+[profiles.cpu]
+
+[profiles.gpu]                  # only what differs from [slurm]
+partition = "gpu"
+qos = "gpu_qos"
+gpus = 1
+mem = "16G"
+
+[jupyter]
+port = 8888
+setup = "module load anaconda3 && conda activate ml"
+
+[sync]
+exclude = [".git/", "__pycache__/", ".venv/", "*.ckpt"]
+```
+
+Command-line flags override environment variables (`CLUSTER_HOST`, `CLUSTER_PROFILE`), which override the profile, which overrides `[slurm]`. The file is parsed as TOML and never executed.
+
+If you used the earlier bash version, its `~/.config/cluster/config` is read until you run `cluster config migrate`.
+
+## Requirements
+
+On your machine: OpenSSH, plus `sshfs` for mounting (macFUSE on macOS) and `rsync` for syncing.
+
+On the cluster: Slurm 20.11 or newer for `srun --overlap` (on older versions pass `--no-overlap`), and Jupyter on the `PATH` after your `[jupyter] setup` command runs. tmux is optional. Home directories must be shared between login and compute nodes, which is the usual setup.
+
+## Development
 
 ```bash
-make
-sudo make install # Or ./install.sh for user local install in ~/.local/bin
+make test       # go vet + go test -race
 ```
 
-Ensure `~/.local/bin` is in your PATH. If not, add the following to your `~/.bashrc` or `~/.zshrc`:
+The lifecycle tests run against fake `ssh`, `sbatch`, `squeue`, `srun` and `scancel` scripts (`internal/lifecycle/*_test.go`). They cover normal exit, connection loss and reattach, tmux detach, a job ending while disconnected, `gc`, and a Jupyter tunnel being killed and restored.
 
-```bash
-export PATH="$HOME/.local/bin:$PATH"
-```
-
----
-
-## CLI Commands
-
-For scripts, automation, or direct terminal usage, all actions can also be executed as CLI subcommands:
-
-### 1. All-in-One Dev Workspace (`cluster dev`)
-Mounts `~/Cluster`, opens Dolphin file manager, and connects to a dedicated compute node shell. When you close the window or type exit, it automatically unmounts the drive and frees the compute node:
-
-```bash
-cluster dev -b
-# Or with GPU
-cluster dev --gpu -b
-```
-
-### 2. Interactive Compute Shell (`cluster shell`)
-Borrow an exclusive compute node for interactive coding without mounting:
-
-```bash
-cluster shell
-# Or GPU
-cluster shell --gpu
-# Customize resources
-cluster shell -c 8 -m 32G -t 02:00:00
-```
-
-### 3. Local Storage Mount (`cluster mount` / `cluster unmount`)
-Mount remote cluster files directly into your local filesystem:
-
-```bash
-cluster mount -b     # Mount and open in Dolphin
-cluster unmount      # Safely detach
-```
-
-### 4. Remote JupyterLab (`cluster jupyter`)
-Launch a visual JupyterLab session with zero manual port management:
-
-```bash
-cluster jupyter            # Head node
-cluster jupyter --slurm    # Compute node
-cluster jupyter --gpu      # GPU node
-```
-
-### 5. Fast Code Sync (`cluster sync`)
-Push or pull changes rapidly:
-
-```bash
-cluster sync push . ~/projects/mycode
-cluster sync pull ~/projects/mycode .
-```
-
-### 6. Cluster Status Dashboard (`cluster status`)
-Check your job queue and cluster health in plain text:
-
-```bash
-cluster status
-```
-
-### 7. One-off Compute Execution (`cluster exec`)
-Dispatch a single command to an allocated compute node:
-
-```bash
-cluster exec --cpus 8 "python train.py --epochs 50"
-```
-
----
-
-## Command Reference
-
-```text
-Usage: cluster [command] [OPTIONS]
-
-Commands:
-  tui                     Open the native C++ TUI dashboard (default when no args)
-  dev [OPTIONS]           All-in-one workspace (mount + compute shell + auto-cleanup)
-  shell [OPTIONS]         Allocate an interactive compute/GPU shell (auto-freed on close)
-  mount [OPTIONS]         Mount cluster filesystem locally via SSHFS
-  unmount                 Safely unmount the local cluster drive
-  jupyter [OPTIONS]       Launch remote JupyterLab with automated tunneling
-  sync <push|pull>        Fast bi-directional code sync via rsync
-  status                  View active Slurm jobs, queues, and node availability
-  exec "<command>"        Run a command directly inside an allocated compute node
-  config                  View or edit your local cluster configuration
-```
-
----
+The earlier bash + C++ implementation is in `legacy/`.
 
 ## License
 
-MIT License. See LICENSE for details.
+MIT

@@ -1,5 +1,5 @@
 # Configuration and secrets
-config
+/config
 .env
 *.local
 

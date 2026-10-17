@@ -1,0 +1,311 @@
+// Package lifecycle owns every resource this tool creates on the user's
+// behalf — Slurm allocations, sshfs mounts, Jupyter servers and tunnels —
+// from creation through reconnects to verified release.
+//
+// The rules:
+//   - Every allocation is an sbatch job whose ID is recorded in the session
+//     store before anything else happens, so nothing is ever untracked.
+//   - Typing `exit` or closing the terminal releases the job (scancel, then
+//     confirm it left the queue) and unmounts anything the session mounted.
+//   - Losing the network does not: the job keeps running, the tool waits for
+//     the cluster to become reachable and reattaches by itself.
+//   - Anything that could not be released (cluster unreachable) stays in the
+//     store and shows up in `cluster ps` and `cluster gc`.
+package lifecycle
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/lunar-photon/cluster/internal/config"
+	"github.com/lunar-photon/cluster/internal/mount"
+	"github.com/lunar-photon/cluster/internal/remote"
+	"github.com/lunar-photon/cluster/internal/session"
+	"github.com/lunar-photon/cluster/internal/slurm"
+)
+
+type Env struct {
+	Cfg   config.Config
+	R     *remote.Client
+	Slurm *slurm.Client
+	Store *session.Store
+	Out   io.Writer
+}
+
+func New(cfg config.Config, r *remote.Client) *Env {
+	return &Env{
+		Cfg:   cfg,
+		R:     r,
+		Slurm: slurm.New(r),
+		Store: session.DefaultStore(),
+		Out:   os.Stderr,
+	}
+}
+
+func (e *Env) printf(format string, a ...any) { fmt.Fprintf(e.Out, format, a...) }
+
+// timeout returns a context for one short remote operation.
+func timeout(d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), d)
+}
+
+// interrupts returns a context cancelled by Ctrl+C, SIGHUP or SIGTERM, and
+// reports which signal arrived.
+func interrupts() (context.Context, func() os.Signal, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt, syscall.SIGHUP, syscall.SIGTERM)
+	var got os.Signal
+	done := make(chan struct{})
+	go func() {
+		select {
+		case got = <-ch:
+			cancel()
+		case <-done:
+		}
+	}()
+	stop := func() {
+		signal.Stop(ch)
+		close(done)
+		cancel()
+	}
+	which := func() os.Signal { <-ctx.Done(); return got }
+	return ctx, which, stop
+}
+
+// Reconnect waits until the cluster is reachable and the shared ssh
+// connection is back, retrying with backoff. Password or 2FA prompts appear
+// in the terminal. It returns ctx.Err() if interrupted.
+func (e *Env) Reconnect(ctx context.Context) error {
+	delay := 2 * time.Second
+	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if e.R.Reachable(ctx) {
+			if err := e.R.EnsureMaster(); err == nil {
+				return nil
+			}
+		}
+		e.printf("\r\033[K  cluster unreachable (attempt %d) — retrying in %s, Ctrl+C to stop", attempt, delay)
+		select {
+		case <-ctx.Done():
+			e.printf("\n")
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		if delay < 30*time.Second {
+			delay *= 2
+		}
+	}
+}
+
+// Release frees everything a session holds and removes it from the store.
+// The session is only forgotten once its job is confirmed gone, so a release
+// that fails while offline can be retried by `cluster gc`.
+func (e *Env) Release(sess session.Session) error {
+	ctx, cancel := timeout(30 * time.Second)
+	defer cancel()
+
+	if sess.TunnelPID > 0 {
+		if p, err := os.FindProcess(sess.TunnelPID); err == nil {
+			_ = p.Signal(syscall.SIGTERM)
+		}
+	}
+
+	var jobErr error
+	switch {
+	case sess.IsSlurm():
+		jobErr = e.cancelAndConfirm(ctx, sess.JobID)
+	case sess.HeadPID > 0:
+		_, jobErr = e.R.Output(ctx, fmt.Sprintf("kill %d 2>/dev/null; true", sess.HeadPID), nil)
+	}
+	if jobErr == nil && len(sess.RemoteFiles) > 0 {
+		_, _ = e.R.Run(ctx, append([]string{"rm", "-f", "--"}, sess.RemoteFiles...)...)
+	}
+
+	var mountErr error
+	if sess.Mount != "" {
+		others, _ := e.Store.List()
+		if !session.MountInUse(others, sess.Mount, sess.JobID) {
+			if mountErr = mount.Unmount(e.R, sess.Mount); mountErr == nil {
+				e.printf("Unmounted %s.\n", sess.Mount)
+			}
+		}
+	}
+
+	if jobErr != nil {
+		e.printf("Could not release %s: %v\n", describe(sess), jobErr)
+		e.printf("It stays tracked; run `cluster gc` once the cluster is reachable.\n")
+		// Keep the record but drop the mount reference we already handled.
+		if mountErr == nil && sess.Mount != "" {
+			sess.Mount = ""
+			_ = e.Store.Add(sess)
+		}
+		return jobErr
+	}
+	_ = e.Store.Delete(sess.JobID)
+	return mountErr
+}
+
+func describe(s session.Session) string {
+	if s.IsSlurm() {
+		return "job " + s.JobID
+	}
+	return "login-node Jupyter (pid " + fmt.Sprint(s.HeadPID) + ")"
+}
+
+// cancelAndConfirm scancels a job and waits until Slurm no longer reports it
+// as holding resources.
+func (e *Env) cancelAndConfirm(ctx context.Context, id string) error {
+	if e.R.DryRun {
+		return e.Slurm.Cancel(ctx, id)
+	}
+	if err := e.Slurm.Cancel(ctx, id); err != nil {
+		return err
+	}
+	for i := 0; i < 10; i++ {
+		job, alive, err := e.Slurm.Alive(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !alive {
+			e.printf("Released job %s.\n", id)
+			return nil
+		}
+		if i == 9 {
+			return fmt.Errorf("scancel sent but job %s is still %s", id, job.State)
+		}
+		time.Sleep(time.Second)
+	}
+	return nil
+}
+
+// Stop releases a tracked session, or scancels an untracked job ID.
+func (e *Env) Stop(jobID string) error {
+	if err := e.R.EnsureMaster(); err != nil {
+		return err
+	}
+	sess, ok, err := e.Store.Get(jobID)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		ctx, cancel := timeout(30 * time.Second)
+		defer cancel()
+		return e.cancelAndConfirm(ctx, jobID)
+	}
+	return e.Release(sess)
+}
+
+// Status pairs a tracked session with its live Slurm state.
+type Status struct {
+	session.Session
+	Job   slurm.Job
+	Alive bool
+	// Err is set when liveness could not be determined.
+	Err error
+}
+
+// Sessions returns tracked sessions with their live state, using one squeue
+// call for all Slurm jobs.
+func (e *Env) Sessions(ctx context.Context) ([]Status, error) {
+	list, err := e.Store.List()
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, s := range list {
+		if s.IsSlurm() {
+			ids = append(ids, s.JobID)
+		}
+	}
+	var jobs []slurm.Job
+	var qerr error
+	if len(ids) > 0 {
+		jobs, qerr = e.Slurm.Jobs(ctx, ids...)
+	}
+	byID := map[string]slurm.Job{}
+	for _, j := range jobs {
+		byID[j.ID] = j
+	}
+	out := make([]Status, 0, len(list))
+	for _, s := range list {
+		st := Status{Session: s}
+		switch {
+		case !s.IsSlurm():
+			_, perr := e.R.Output(ctx, fmt.Sprintf("kill -0 %d", s.HeadPID), nil)
+			st.Alive = perr == nil
+			if errors.Is(perr, remote.ErrConnection) {
+				st.Err = perr
+			}
+		case qerr != nil:
+			st.Err = qerr
+		default:
+			st.Job = byID[s.JobID]
+			st.Alive = slurm.IsActive(st.Job.State)
+		}
+		out = append(out, st)
+	}
+	return out, nil
+}
+
+// GC forgets sessions whose jobs have ended, unmounting what they mounted,
+// and reports (or with cancel, cancels) running jobs named cluster:* that no
+// tracked session owns — e.g. from a machine that crashed.
+func (e *Env) GC(cancelUntracked bool) error {
+	if err := e.R.EnsureMaster(); err != nil {
+		return err
+	}
+	ctx, cancel := timeout(60 * time.Second)
+	defer cancel()
+
+	statuses, err := e.Sessions(ctx)
+	if err != nil {
+		return err
+	}
+	tracked := map[string]bool{}
+	cleaned := 0
+	for _, st := range statuses {
+		tracked[st.JobID] = true
+		if st.Err != nil || st.Alive {
+			continue
+		}
+		e.printf("%s has ended; cleaning up.\n", describe(st.Session))
+		st.TunnelPID = 0
+		if err := e.Release(st.Session); err == nil {
+			cleaned++
+		}
+	}
+
+	jobs, err := e.Slurm.Jobs(ctx)
+	if err != nil {
+		return err
+	}
+	var orphans []string
+	for _, j := range jobs {
+		if len(j.Name) > len(slurm.JobPrefix) && j.Name[:len(slurm.JobPrefix)] == slurm.JobPrefix && !tracked[j.ID] && slurm.IsActive(j.State) {
+			orphans = append(orphans, j.ID)
+			e.printf("Untracked job %s (%s, %s, %s)\n", j.ID, j.Name, j.State, j.NodeList)
+		}
+	}
+	if len(orphans) > 0 {
+		if cancelUntracked {
+			for _, id := range orphans {
+				_ = e.cancelAndConfirm(ctx, id)
+			}
+		} else {
+			e.printf("These were started by cluster but are not tracked on this machine. Cancel them with `cluster gc --cancel-untracked`.\n")
+		}
+	}
+	if cleaned == 0 && len(orphans) == 0 {
+		e.printf("Nothing to clean up.\n")
+	}
+	return nil
+}
