@@ -116,6 +116,14 @@ func Mount(r *remote.Client, remoteDir, local string) (bool, error) {
 	return true, nil
 }
 
+// DisplayDir names a remote directory for messages; empty means home.
+func DisplayDir(remoteDir string) string {
+	if remoteDir == "" {
+		return "~"
+	}
+	return remoteDir
+}
+
 // Unmount detaches local. On Linux it uses a lazy unmount so a busy file
 // manager window does not block it.
 func Unmount(r *remote.Client, local string) error {

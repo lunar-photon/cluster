@@ -81,6 +81,7 @@ with Ctrl+b d, and come back later with cluster attach.`,
 
 func attachCmd(g *globals) *cobra.Command {
 	var pf persistFlags
+	var noBrowser bool
 	cmd := &cobra.Command{
 		Use:   "attach [JOBID]",
 		Short: "Reconnect to a running session (default: the most recent)",
@@ -103,10 +104,11 @@ func attachCmd(g *globals) *cobra.Command {
 				}
 				id = list[0].JobID
 			}
-			return e.Attach(id, !pf.noPersist, !pf.noOverlap)
+			return e.Attach(id, !pf.noPersist, !pf.noOverlap, !noBrowser)
 		},
 	}
 	pf.register(cmd)
+	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "for a Jupyter session, print the URL without opening a browser")
 	return cmd
 }
 
@@ -301,7 +303,7 @@ func mountCmd(g *globals) *cobra.Command {
 				return err
 			}
 			if created {
-				fmt.Printf("Mounted %s:%s at %s. Run `cluster unmount` when done.\n", e.Cfg.Host, dir, mp)
+				fmt.Printf("Mounted %s:%s at %s. Run `cluster unmount` when done.\n", e.Cfg.Host, mount.DisplayDir(dir), mp)
 			} else {
 				fmt.Printf("%s is already mounted.\n", mp)
 			}

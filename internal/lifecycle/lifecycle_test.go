@@ -65,7 +65,7 @@ const fakeSrun = `#!/usr/bin/env bash
 if [[ "$*" == *list-panes* ]]; then cat "$FAKE/panes" 2>/dev/null; exit 0; fi
 echo "$*" >> "$FAKE/srun_calls"
 code=$(head -n1 "$FAKE/srun_codes"); sed -i 1d "$FAKE/srun_codes"
-if [[ "$code" == hup ]]; then touch "$FAKE/attached"; sleep 1; exit 255; fi
+if [[ "$code" == hup ]]; then touch "$FAKE/attached"; exec sleep 30; fi # like real ssh: does not exit when the terminal closes
 exit "${code:-0}"
 `
 
@@ -218,7 +218,7 @@ func TestDetachKeepsJob(t *testing.T) {
 
 	// Reattach later, then exit.
 	os.WriteFile(filepath.Join(f.dir, "srun_codes"), []byte("0\n"), 0o644)
-	if err := f.env.Attach("1001", true, true); err != nil {
+	if err := f.env.Attach("1001", true, true, false); err != nil {
 		t.Fatalf("%v\n%s", err, f.out)
 	}
 	if strings.TrimSpace(f.read("cancelled")) != "1001" || len(f.sessions(t)) != 0 {

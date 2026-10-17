@@ -16,7 +16,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // Quote single-quotes s for a POSIX shell.
@@ -160,15 +163,46 @@ func (c *Client) Run(ctx context.Context, argv ...string) (string, error) {
 
 // Interactive runs remoteCmd with a pty attached to the local terminal.
 func (c *Client) Interactive(remoteCmd string) error {
-	args := c.sshArgs([]string{"-t"}, remoteCmd)
+	return c.InteractiveUntil(remoteCmd, nil)
+}
+
+// InteractiveUntil is Interactive, but if stop delivers a signal first, the
+// ssh process is sent SIGHUP (then killed after 5s) and ErrStopped returned.
+// ssh does not reliably exit by itself when the terminal goes away.
+func (c *Client) InteractiveUntil(remoteCmd string, stop <-chan os.Signal) error {
+	tty := "-T" // e.g. `cluster exec ... | less`: no pty, and no ssh warning about it
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		tty = "-t"
+	}
+	args := c.sshArgs([]string{tty}, remoteCmd)
 	c.trace(c.SSH, args)
 	if c.DryRun {
 		return nil
 	}
 	cmd := exec.Command(c.SSH, args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return wrapErr(cmd.Run(), "")
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return wrapErr(err, "")
+	case <-stop:
+		_ = cmd.Process.Signal(syscall.SIGHUP)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+		return ErrStopped
+	}
 }
+
+// ErrStopped is returned by InteractiveUntil when its stop channel fired.
+var ErrStopped = errors.New("stopped")
 
 // Command builds an ssh exec.Cmd for callers that manage the process
 // themselves (e.g. long-running tunnels).

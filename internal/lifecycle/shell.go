@@ -152,7 +152,7 @@ func (e *Env) StartShell(o ShellOpts) error {
 		case err != nil:
 			e.printf("Warning: %v — continuing without the mount.\n", err)
 		case created:
-			e.printf("Mounted %s:%s at %s.\n", e.R.Host, o.RemoteDir, mp)
+			e.printf("Mounted %s:%s at %s.\n", e.R.Host, mount.DisplayDir(o.RemoteDir), mp)
 			sess.Mount = mp
 		default:
 			// Share ownership with a tracked session that mounted it, so whichever
@@ -191,7 +191,7 @@ func (e *Env) StartShell(o ShellOpts) error {
 }
 
 // Attach reconnects to a tracked shell/dev session, or re-tunnels a Jupyter one.
-func (e *Env) Attach(jobID string, persist, overlap bool) error {
+func (e *Env) Attach(jobID string, persist, overlap, browse bool) error {
 	if err := e.R.EnsureMaster(); err != nil {
 		return err
 	}
@@ -206,7 +206,7 @@ func (e *Env) Attach(jobID string, persist, overlap bool) error {
 		if sess.Node == "" {
 			return fmt.Errorf("Jupyter session %s never finished starting; release it with `cluster stop %s`", jobID, jobID)
 		}
-		return e.serveJupyter(sess, true)
+		return e.serveJupyter(sess, browse)
 	}
 	ctx, cancel := timeout(30 * time.Second)
 	_, alive, err := e.Slurm.Alive(ctx, jobID)
@@ -287,14 +287,17 @@ func (e *Env) attachLoop(sess session.Session, persist, overlap bool) error {
 	defer signal.Stop(discard)
 
 	for {
-		err := e.R.Interactive(attachCommand(sess.JobID, persist, overlap))
+		err := e.R.InteractiveUntil(attachCommand(sess.JobID, persist, overlap), hup)
+		if errors.Is(err, remote.ErrStopped) {
+			return e.terminalClosed(sess, overlap)
+		}
 		code := 0
 		if err != nil {
 			code = remote.ExitCode(err)
 		}
 
-		// ssh dies of the same SIGHUP that tells us the terminal closed; give
-		// the signal a moment to arrive before deciding what happened.
+		// ssh may die of the same SIGHUP that tells us the terminal closed;
+		// give the signal a moment to arrive before deciding what happened.
 		select {
 		case <-hup:
 			return e.terminalClosed(sess, overlap)
