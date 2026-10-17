@@ -58,6 +58,12 @@ find_free_port() {
     echo "$p"
 }
 
+# Single-quote a string for a POSIX shell on the remote side
+shell_quote() {
+    local s="$1"
+    printf "'%s'" "${s//\'/\'\\\'\'}"
+}
+
 # Check that host is defined
 require_host() {
     if [[ -z "$HOST" ]]; then
@@ -448,13 +454,7 @@ cmd_jupyter() {
         EXEC_CMD+=("${EXTRA[@]}")
     fi
 
-    cleanup_jupyter() {
-        trap - EXIT SIGHUP SIGINT SIGTERM
-        echo ""
-        echo "Jupyter session closed. Port forwarding terminated."
-    }
-    trap cleanup_jupyter EXIT SIGHUP SIGINT SIGTERM
-
+    # No trap here: exec replaces this shell, so jupyter-forward owns cleanup from now on.
     echo "Launching JupyterLab via $HOST (port $ACTIVE_PORT)..."
     exec "${EXEC_CMD[@]}"
 }
@@ -611,6 +611,8 @@ cmd_exec() {
     local ACC="$SLURM_ACCOUNT"
     local COMMAND=""
 
+    # Options end at the first non-option word; everything after it is the command,
+    # joined with spaces like ssh does (so both `exec "a | b"` and `exec a b` work).
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -c|--cpus) CPUS="$2"; shift 2 ;;
@@ -619,16 +621,23 @@ cmd_exec() {
             -p|--partition) PART="$2"; shift 2 ;;
             -q|--qos) QOS="$2"; shift 2 ;;
             -A|--account) ACC="$2"; shift 2 ;;
-            *) COMMAND="$1"; shift ;;
+            -H|--host) HOST="$2"; shift 2 ;;
+            --) shift; COMMAND="$*"; break ;;
+            *) COMMAND="$*"; break ;;
         esac
     done
+
+    if [[ -z "$COMMAND" ]]; then
+        echo "Usage: cluster exec [OPTIONS] \"<command>\"" >&2
+        exit 1
+    fi
 
     local SLURM_ARGS="-p $PART -c $CPUS --mem=$MEM -t $TIME"
     [[ -n "$ACC" ]] && SLURM_ARGS="$SLURM_ARGS -A $ACC"
     [[ -n "$QOS" ]] && SLURM_ARGS="$SLURM_ARGS --qos=$QOS"
 
     echo "Dispatching execution to compute node ($SLURM_ARGS)..."
-    ssh "$HOST" "srun $SLURM_ARGS bash -lc \"$COMMAND\""
+    ssh "$HOST" "srun $SLURM_ARGS bash -lc $(shell_quote "$COMMAND")"
 }
 
 cmd_config() {

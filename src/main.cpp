@@ -4,7 +4,6 @@
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/dom/table.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -108,7 +107,7 @@ void save_config(const Config& cfg) {
     f << "SLURM_PARTITION=\"" << cfg.slurm_partition << "\"\n";
     f << "SLURM_ACCOUNT=\"" << cfg.slurm_account << "\"\n";
     f << "SLURM_QOS=\"" << cfg.slurm_qos << "\"\n";
-    f << "SLURM_CPUS=" << cfg.slurm_cpus << "\"\n";
+    f << "SLURM_CPUS=\"" << cfg.slurm_cpus << "\"\n";
     f << "SLURM_MEM=\"" << cfg.slurm_mem << "\"\n";
     f << "SLURM_TIME=\"" << cfg.slurm_time << "\"\n";
     f << "GPU_PARTITION=\"" << cfg.gpu_partition << "\"\n";
@@ -117,15 +116,35 @@ void save_config(const Config& cfg) {
     f << "NOTEBOOK_DIR=\"" << cfg.notebook_dir << "\"\n";
 }
 
+// /proc/mounts escapes space, tab, newline and backslash as \ooo octal sequences
+std::string unescape_mount_path(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size()) {
+            const std::string oct = s.substr(i + 1, 3);
+            if (oct.find_first_not_of("01234567") == std::string::npos) {
+                out += static_cast<char>(std::stoi(oct, nullptr, 8));
+                i += 3;
+                continue;
+            }
+        }
+        out += s[i];
+    }
+    return out;
+}
+
+// Compares paths lexically only. Never stat() the mount point here: this runs on
+// every frame, and stat() on a stale sshfs mount can block indefinitely.
 bool check_is_mounted(const std::string& mount_path) {
     std::ifstream mounts("/proc/mounts");
     std::string line;
-    std::string norm_path = fs::weakly_canonical(mount_path).string();
+    std::string norm_path = fs::path(mount_path).lexically_normal().string();
+    while (norm_path.size() > 1 && norm_path.back() == '/') norm_path.pop_back();
     while (std::getline(mounts, line)) {
         std::istringstream iss(line);
         std::string dev, target;
         if (iss >> dev >> target) {
-            if (target == norm_path || target == mount_path) {
+            if (unescape_mount_path(target) == norm_path) {
                 return true;
             }
         }
@@ -176,45 +195,58 @@ int main() {
         {"PARTITION", "AVAIL", "TIMELIMIT", "NODES", "STATE", "NODELIST"}
     };
 
-    auto refresh_monitor = [&]() {
-        if (cfg.host.empty()) return;
-        std::string q_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 " + cfg.host + " 'squeue -u $USER -o \"%i|%P|%j|%u|%T|%M|%D|%R\"' 2>/dev/null";
+    using TableData = std::vector<std::vector<std::string>>;
+
+    // Runs on a worker thread: touches only its arguments, never shared UI state.
+    auto fetch_jobs = [](const std::string& host) {
+        TableData data = {{"JOBID", "PARTITION", "NAME", "USER", "STATE", "TIME", "NODES", "NODELIST"}};
+        std::string q_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 " + host + " 'squeue -u $USER -o \"%i|%P|%j|%u|%T|%M|%D|%R\"' 2>/dev/null";
         auto lines = run_pipe_cmd(q_cmd);
-        jobs_data.clear();
-        jobs_data.push_back({"JOBID", "PARTITION", "NAME", "USER", "STATE", "TIME", "NODES", "NODELIST"});
         for (size_t i = 1; i < lines.size(); ++i) {
             std::vector<std::string> row;
             parse_delimited(lines[i], '|', row);
             if (row.size() >= 8) {
-                jobs_data.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]});
+                data.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]});
             }
         }
+        return data;
+    };
 
-        std::string i_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 " + cfg.host + " 'sinfo -o \"%P|%a|%l|%D|%T|%N\"' 2>/dev/null";
+    auto fetch_nodes = [](const std::string& host) {
+        TableData data = {{"PARTITION", "AVAIL", "TIMELIMIT", "NODES", "STATE", "NODELIST"}};
+        std::string i_cmd = "ssh -o BatchMode=yes -o ConnectTimeout=3 " + host + " 'sinfo -o \"%P|%a|%l|%D|%T|%N\"' 2>/dev/null";
         auto n_lines = run_pipe_cmd(i_cmd);
-        nodes_data.clear();
-        nodes_data.push_back({"PARTITION", "AVAIL", "TIMELIMIT", "NODES", "STATE", "NODELIST"});
         for (size_t i = 1; i < n_lines.size(); ++i) {
             std::vector<std::string> row;
             parse_delimited(n_lines[i], '|', row);
             if (row.size() >= 6) {
-                nodes_data.push_back({row[0], row[1], row[2], row[3], row[4], row[5]});
+                data.push_back({row[0], row[1], row[2], row[3], row[4], row[5]});
             }
         }
+        return data;
     };
 
-    std::atomic<bool> is_refreshing{false};
+    // Only the UI thread reads or writes this flag and the tables; the worker hands
+    // its results back through screen.Post, which runs the closure on the UI thread.
+    bool is_refreshing = false;
+    std::thread refresh_thread;
     auto trigger_refresh = [&]() {
-        if (is_refreshing) return;
+        if (is_refreshing || cfg.host.empty()) return;
         is_refreshing = true;
         feedback_msg = "Refreshing status...";
-        screen.PostEvent(Event::Custom);
-        std::thread([&] {
-            refresh_monitor();
-            is_refreshing = false;
-            feedback_msg = "";
+        if (refresh_thread.joinable()) refresh_thread.join();
+        refresh_thread = std::thread([&screen, &jobs_data, &nodes_data, &feedback_msg, &is_refreshing,
+                                      fetch_jobs, fetch_nodes, host = cfg.host] {
+            auto jobs = fetch_jobs(host);
+            auto nodes = fetch_nodes(host);
+            screen.Post([&, jobs = std::move(jobs), nodes = std::move(nodes)]() mutable {
+                jobs_data = std::move(jobs);
+                nodes_data = std::move(nodes);
+                feedback_msg = "";
+                is_refreshing = false;
+            });
             screen.PostEvent(Event::Custom);
-        }).detach();
+        });
     };
 
     // Run external command with terminal I/O restored
@@ -232,7 +264,7 @@ int main() {
     auto btn_shell_cpu = Button("Interactive CPU Shell", [&] { exec_command("cluster shell"); });
     auto btn_shell_gpu = Button("Interactive GPU Shell", [&] { exec_command("cluster shell --gpu"); });
 
-    auto btn_jup_head  = Button("JupyterLab (Head Node)", [&] { exec_command("cluster jupyter"); });
+    auto btn_jup_head  = Button("JupyterLab (Head Node)", [&] { exec_command("cluster jupyter --head"); });
     auto btn_jup_slurm = Button("JupyterLab (Slurm CPU)", [&] { exec_command("cluster jupyter --slurm"); });
     auto btn_jup_gpu   = Button("JupyterLab (GPU Node)",   [&] { exec_command("cluster jupyter --gpu"); });
 
@@ -469,5 +501,7 @@ int main() {
     trigger_refresh();
 
     screen.Loop(renderer);
+    // The worker references locals of main(); wait for it before they are destroyed.
+    if (refresh_thread.joinable()) refresh_thread.join();
     return 0;
 }
