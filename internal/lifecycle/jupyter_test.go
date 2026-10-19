@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -89,6 +90,11 @@ echo 1001
 	f.env.Cfg.Jupyter.Port = freePort(18888)
 
 	done := make(chan error, 1)
+	// Answers to Jupyter's prompt arrive through a pipe set up before it
+	// starts, so the test never swaps the reader while Jupyter reads it.
+	answers, answer := io.Pipe()
+	defer answer.Close()
+	f.env.In = answers
 	go func() {
 		done <- f.env.Jupyter(JupyterOpts{Req: slurm.Request{}, Profile: "cpu"})
 	}()
@@ -111,7 +117,7 @@ echo 1001
 
 	// Ctrl+C with a kernel open asks first; answering no keeps Jupyter.
 	kernels.Store(1)
-	f.env.In = strings.NewReader("n\n")
+	go answer.Write([]byte("n\n"))
 	syscall.Kill(os.Getpid(), syscall.SIGINT)
 	waitFor(t, f, "Jupyter keeps running.")
 	waitFor(t, f, "Tunnel restored")
