@@ -238,6 +238,14 @@ func tmuxBuildRequest(e *lifecycle.Env) (slurm.Request, error) {
 }
 
 func buildTmux(e *lifecycle.Env, req slurm.Request) error {
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := e.CheckPolicy(ctx, req)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
 	fmt.Println("\nDownloading and verifying sources on the login node:")
 	fetch := e.R.Command([]string{"-T"}, "bash -s")
 	fetch.Stdin = strings.NewReader(tmuxFetchScript())

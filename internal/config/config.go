@@ -92,6 +92,12 @@ type Config struct {
 	Sync           Sync             `toml:"sync"`
 	// JobPrefix starts the name of every job cluster submits.
 	JobPrefix string `toml:"job_prefix,omitempty"`
+	// Policy holds usage rules that apply everywhere; a project's
+	// .cluster.toml can add its own.
+	Policy Policy `toml:"policy,omitempty"`
+
+	// Project is the .cluster.toml found from the working directory, if any.
+	Project *Project `toml:"-"`
 
 	// Path is where the config was loaded from (or will be saved to).
 	Path string `toml:"-"`
@@ -104,13 +110,25 @@ type Config struct {
 // DefaultJobPrefix names jobs when the config sets no job_prefix.
 const DefaultJobPrefix = "cluster:"
 
-// JobName is the Slurm job name for a kind of job, e.g. "cluster:terminal".
-func (c Config) JobName(kind string) string {
+// JobPrefix in effect: the project's, else the user's, else the default;
+// replaced by the policy's required prefix if it doesn't already start with it.
+func (c Config) EffectiveJobPrefix() string {
 	prefix := c.JobPrefix
+	if c.Project != nil && c.Project.JobPrefix != "" {
+		prefix = c.Project.JobPrefix
+	}
 	if prefix == "" {
 		prefix = DefaultJobPrefix
 	}
-	return prefix + kind
+	if req := c.EffectivePolicy().JobPrefix; req != "" && !strings.HasPrefix(prefix, req) {
+		prefix = req
+	}
+	return prefix
+}
+
+// JobName is the Slurm job name for a kind of job, e.g. "cluster:terminal".
+func (c Config) JobName(kind string) string {
+	return c.EffectiveJobPrefix() + kind
 }
 
 var DefaultSyncExcludes = []string{
@@ -196,6 +214,15 @@ func Load(path string) (Config, error) {
 		return cfg, err
 	}
 
+	if os.Getenv("CLUSTER_NO_PROJECT") == "" {
+		wd, _ := os.Getwd()
+		proj, err := FindProject(wd)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Project = proj
+	}
+
 	if h := os.Getenv("CLUSTER_HOST"); h != "" {
 		cfg.Host = h
 	}
@@ -214,6 +241,7 @@ func overlay(base, file Config) Config {
 	if file.JobPrefix != "" {
 		out.JobPrefix = file.JobPrefix
 	}
+	out.Policy = out.Policy.merge(file.Policy)
 	if file.MountPoint != "" {
 		out.MountPoint = file.MountPoint
 	}
@@ -247,18 +275,24 @@ func overlay(base, file Config) Config {
 
 // Profile resolves a named profile on top of the [slurm] defaults. An empty
 // name selects DefaultProfile.
+// A project's [slurm] defaults apply between the user's [slurm] and the
+// profile's own values.
 func (c Config) Profile(name string) (Slurm, error) {
+	base := c.Slurm
+	if c.Project != nil {
+		base = base.Merge(c.Project.Slurm)
+	}
 	if name == "" {
 		name = c.DefaultProfile
 	}
 	if name == "" {
-		return c.Slurm, nil
+		return base, nil
 	}
 	p, ok := c.Profiles[name]
 	if !ok {
 		return Slurm{}, fmt.Errorf("unknown profile %q (have: %s)", name, strings.Join(c.ProfileNames(), ", "))
 	}
-	return c.Slurm.Merge(p), nil
+	return base.Merge(p), nil
 }
 
 func (c Config) ProfileNames() []string {

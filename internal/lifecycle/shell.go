@@ -147,6 +147,17 @@ func (e *Env) StartShell(o ShellOpts) error {
 
 	if o.Mount {
 		sess.Kind = session.TerminalMount
+	}
+	o.Req.Name = e.Cfg.JobName(strings.ReplaceAll(string(sess.Kind), "+", "-"))
+	{
+		ctx, cancel := timeout(30 * time.Second)
+		err := e.CheckPolicy(ctx, o.Req)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	if o.Mount {
 		mp := e.Cfg.LocalMountPoint()
 		created, err := mount.Mount(e.R, o.RemoteDir, mp)
 		switch {
@@ -169,7 +180,6 @@ func (e *Env) StartShell(o ShellOpts) error {
 	}
 
 	ctx, cancel := timeout(60 * time.Second)
-	o.Req.Name = e.Cfg.JobName(strings.ReplaceAll(string(sess.Kind), "+", "-"))
 	id, err := e.Slurm.Submit(ctx, o.Req, holdScript(o.Persist), "--output=/dev/null")
 	cancel()
 	if err != nil {

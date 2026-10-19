@@ -860,6 +860,13 @@ func (m model) viewCluster() string {
 	for _, line := range m.info.UsageText() {
 		b.WriteString("     " + mutedSt.Render(line) + "\n")
 	}
+	if pol := m.cfg.EffectivePolicy(); !pol.Empty() {
+		src := "your config"
+		if m.cfg.Project != nil && !m.cfg.Project.Policy.Empty() {
+			src = config.ShortPath(m.cfg.Project.Path)
+		}
+		b.WriteString(hang(warnSt.Render("Rules")+" "+mutedSt.Render("("+src+"): ")+strings.Join(pol.Lines(), " · "), "", m.width))
+	}
 	when := m.lastRefresh.Format("15:04:05")
 	b.WriteString("\n" + accentSt.Render("Partitions") + mutedSt.Render("  updated "+when+", every 30s · nodes: idle/partly used/full/unavailable") + "\n")
 

@@ -101,6 +101,9 @@ func (e *Env) Jupyter(o JupyterOpts) error {
 	}
 
 	o.Req.Name = e.Cfg.JobName("jupyter")
+	if err := e.CheckPolicy(ctx, o.Req); err != nil {
+		return err
+	}
 	id, err := e.Slurm.Submit(ctx, o.Req, jupyterScript(e.Cfg.Jupyter.Setup, o.Dir, token),
 		"--output=.cluster/jupyter-%j.log")
 	if err != nil {

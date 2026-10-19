@@ -404,7 +404,8 @@ func syncCmd(g *globals) *cobra.Command {
   cluster sync pull [LOCAL_DIR] [REMOTE_DIR]   cluster -> local
 
 LOCAL_DIR defaults to the current directory; REMOTE_DIR defaults to a
-directory of the same name in your remote home. Patterns in [sync] exclude
+directory of the same name in your remote home, or, inside a project whose
+.cluster.toml sets remote_path, the matching place under that path. Patterns in [sync] exclude
 are skipped.`,
 		Args:      cobra.RangeArgs(1, 3),
 		ValidArgs: []string{"push", "pull"},
@@ -425,7 +426,7 @@ are skipped.`,
 			if err != nil {
 				return err
 			}
-			remoteDir := filepath.Base(abs)
+			remoteDir := e.Cfg.RemotePathFor(abs)
 			if len(args) > 2 {
 				remoteDir = args[2]
 			}
@@ -439,7 +440,7 @@ are skipped.`,
 			if preview {
 				rargs = append(rargs, "--dry-run", "--itemize-changes")
 			}
-			for _, x := range e.Cfg.Sync.Exclude {
+			for _, x := range e.Cfg.SyncExcludes() {
 				rargs = append(rargs, "--exclude="+x)
 			}
 			src, dst := abs+"/", e.Cfg.Host+":"+remoteDir+"/"
@@ -569,7 +570,7 @@ over cores × run time) and peak memory where the cluster records it.`,
 					}
 					out = append(out, jj)
 				}
-				result := map[string]any{"jobs": out, "cluster": clusterJSON(e.Cfg.Host, info)}
+				result := map[string]any{"jobs": out, "cluster": clusterJSON(e.Cfg, info)}
 				if since != "" {
 					f := []finishedJSON{}
 					for _, a := range finished {
@@ -607,7 +608,7 @@ over cores × run time) and peak memory where the cluster records it.`,
 				printFinished(os.Stdout, finished)
 			}
 			fmt.Println()
-			printInfo(os.Stdout, e.Cfg.Host, info)
+			printInfo(os.Stdout, e.Cfg, info)
 			return nil
 		},
 	}
@@ -652,6 +653,14 @@ it with cluster logs -f.`,
 				return err
 			}
 			req.Name = e.Cfg.JobName("exec")
+			{
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				err := e.CheckPolicy(ctx, req)
+				cancel()
+				if err != nil {
+					return err
+				}
+			}
 			argv := append(append([]string{"srun"}, req.Args()...), "bash", "-lc", line)
 			fmt.Fprintf(os.Stderr, "srun %s\n", req)
 			err = e.R.Interactive(remote.Join(argv...))

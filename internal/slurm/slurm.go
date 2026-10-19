@@ -220,3 +220,17 @@ func IsActive(state string) bool {
 	}
 	return false
 }
+
+// DefaultPartition is the partition jobs go to when none is requested.
+func (c *Client) DefaultPartition(ctx context.Context) (string, error) {
+	out, err := c.R.Output(ctx, "sinfo -h -o %P", nil)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range strings.Fields(out) {
+		if strings.HasSuffix(p, "*") {
+			return strings.TrimSuffix(p, "*"), nil
+		}
+	}
+	return "", nil
+}

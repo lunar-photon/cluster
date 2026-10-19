@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/lunar-photon/cluster/internal/config"
 	"github.com/lunar-photon/cluster/internal/slurm"
 )
 
@@ -43,7 +45,7 @@ at the top. Give a partition name for its full detail.`,
 				info.PreferredQOS = p.QOS
 			}
 			if asJSON {
-				j := clusterJSON(e.Cfg.Host, info)
+				j := clusterJSON(e.Cfg, info)
 				if len(args) == 1 {
 					for _, p := range j.Partitions {
 						if p.Name == args[0] {
@@ -65,7 +67,7 @@ at the top. Give a partition name for its full detail.`,
 				}
 				return fmt.Errorf("no partition %q", args[0])
 			}
-			printInfo(os.Stdout, e.Cfg.Host, info)
+			printInfo(os.Stdout, e.Cfg, info)
 			return nil
 		},
 	}
@@ -135,7 +137,29 @@ type qosJSON struct {
 	UsedGPUs        int    `json:"used_gpus"`
 }
 
+type policyJSON struct {
+	Source       string   `json:"source"`
+	JobPrefix    string   `json:"job_prefix,omitempty"`
+	Partitions   []string `json:"partitions,omitempty"`
+	MaxJobs      int      `json:"max_jobs,omitempty"`
+	MaxCPUs      int      `json:"max_cpus_per_job,omitempty"`
+	MaxTotalCPUs int      `json:"max_total_cpus,omitempty"`
+	Rules        []string `json:"rules"`
+}
+
+// policySource names where the rules come from.
+func policySource(cfg config.Config) string {
+	switch {
+	case cfg.Project != nil && !cfg.Project.Policy.Empty() && !cfg.Policy.Empty():
+		return "your config and " + config.ShortPath(cfg.Project.Path)
+	case cfg.Project != nil && !cfg.Project.Policy.Empty():
+		return config.ShortPath(cfg.Project.Path)
+	}
+	return "your config"
+}
+
 type clusterInfoJSON struct {
+	Policy     *policyJSON     `json:"policy,omitempty"`
 	User       string          `json:"user"`
 	Host       string          `json:"host"`
 	Accounts   []string        `json:"accounts"`
@@ -144,8 +168,12 @@ type clusterInfoJSON struct {
 	Partitions []partitionJSON `json:"partitions"`
 }
 
-func clusterJSON(host string, info *slurm.Info) clusterInfoJSON {
-	j := clusterInfoJSON{User: info.User, Host: host, MemTracked: info.MemTracked, Accounts: []string{}, QOS: []qosJSON{}}
+func clusterJSON(cfg config.Config, info *slurm.Info) clusterInfoJSON {
+	j := clusterInfoJSON{User: info.User, Host: cfg.Host, MemTracked: info.MemTracked, Accounts: []string{}, QOS: []qosJSON{}}
+	if pol := cfg.EffectivePolicy(); !pol.Empty() {
+		j.Policy = &policyJSON{Source: policySource(cfg), JobPrefix: pol.JobPrefix, Partitions: pol.Partitions,
+			MaxJobs: pol.MaxJobs, MaxCPUs: pol.MaxCPUs, MaxTotalCPUs: pol.MaxTotalCPUs, Rules: pol.Lines()}
+	}
 	usage := info.Usage()
 	seenA, seenQ := map[string]bool{}, map[string]bool{}
 	for _, a := range info.Assocs {
@@ -192,10 +220,13 @@ func nonNil(s []string) []string {
 	return s
 }
 
-func printInfo(w io.Writer, host string, info *slurm.Info) {
-	fmt.Fprintf(w, "%s@%s · %s\n", info.User, host, info.AccountText())
+func printInfo(w io.Writer, cfg config.Config, info *slurm.Info) {
+	fmt.Fprintf(w, "%s@%s · %s\n", info.User, cfg.Host, info.AccountText())
 	for _, line := range info.UsageText() {
 		fmt.Fprintf(w, "  %s\n", line)
+	}
+	if pol := cfg.EffectivePolicy(); !pol.Empty() {
+		fmt.Fprintf(w, "Rules (%s): %s\n", policySource(cfg), strings.Join(pol.Lines(), " · "))
 	}
 	fmt.Fprintln(w)
 	printPartitionTable(w, info)
