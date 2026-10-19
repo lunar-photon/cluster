@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -469,7 +470,7 @@ func progressFlag() string {
 }
 
 func statusCmd(g *globals) *cobra.Command {
-	var name string
+	var name, since string
 	var asJSON bool
 	cmd := &cobra.Command{
 		Use:     "status",
@@ -478,7 +479,15 @@ func statusCmd(g *globals) *cobra.Command {
 		Long: `Show your queued and running jobs. For running jobs it also shows how long
 ago they last wrote output, and their progress and estimated finish when
 they print lines such as "##progress 250/3733" (see cluster logs --help).
-Below that come the partitions, free resources and your limits.`,
+Below that come the partitions, free resources and your limits.
+
+SUGGESTED is a time limit from earlier runs with the same job name: the
+longest of the last 10 that completed or timed out, plus 50%. It's marked
+when a job's limit is shorter than that.
+
+--since 1d adds jobs that ended in that window, from Slurm's accounting:
+state, exit code, run time against the limit, CPU efficiency (CPU time used
+over cores × run time) and peak memory where the cluster records it.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			e, err := g.env()
@@ -518,6 +527,33 @@ Below that come the partitions, free resources and your limits.`,
 			if p, err := e.Cfg.Profile(""); err == nil {
 				info.PreferredQOS = p.QOS
 			}
+
+			// Accounting: 30 days for suggestions, longer if --since asks.
+			histStart, cutoff := "now-30days", time.Time{}
+			if since != "" {
+				start, c, err := slurm.SinceArg(since, time.Now())
+				if err != nil {
+					return err
+				}
+				cutoff = c
+				if c.Before(time.Now().Add(-30 * 24 * time.Hour)) {
+					histStart = start
+				}
+			}
+			history, herr := e.Slurm.Accounting(ctx, nil, histStart)
+			if herr != nil && since != "" {
+				return fmt.Errorf("reading accounting: %w", herr)
+			}
+			suggest := func(name string) (slurm.Suggestion, bool) { return slurm.SuggestLimit(history, name, 10, 1.5) }
+			var finished []slurm.Accounting
+			if since != "" {
+				for _, a := range history {
+					if a.Final() && !a.End.Before(cutoff) && nameMatches(name, a.Name) {
+						finished = append(finished, a)
+					}
+				}
+			}
+
 			if asJSON {
 				out := []jobJSON{}
 				for _, j := range jobs {
@@ -527,27 +563,49 @@ Below that come the partitions, free resources and your limits.`,
 					if l, ok := live[j.ID]; ok {
 						jj.Output = liveJSON(l, 0)
 					}
+					if s, ok := suggest(j.Name); ok {
+						jj.Suggested = &suggestionJSON{LimitS: int64(s.Limit.Seconds()), Runs: s.Runs, LongestS: int64(s.Longest.Seconds()),
+							LimitShort: slurm.ParseDuration(j.TimeLimit) > 0 && slurm.ParseDuration(j.TimeLimit) < s.Limit}
+					}
 					out = append(out, jj)
 				}
-				return printJSON(map[string]any{"jobs": out, "cluster": clusterJSON(e.Cfg.Host, info)})
+				result := map[string]any{"jobs": out, "cluster": clusterJSON(e.Cfg.Host, info)}
+				if since != "" {
+					f := []finishedJSON{}
+					for _, a := range finished {
+						f = append(f, accountingJSON(a))
+					}
+					result["finished"] = f
+				}
+				return printJSON(result)
 			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "JOBID\tPARTITION\tNAME\tSTATE\tTIME\tLIMIT\tCPUs\tNODELIST(REASON)\tLAST OUTPUT\tPROGRESS")
+			fmt.Fprintln(w, "JOBID\tPARTITION\tNAME\tSTATE\tTIME\tLIMIT\tCPUs\tNODELIST(REASON)\tLAST OUTPUT\tPROGRESS\tSUGGESTED")
 			for _, j := range jobs {
-				last, prog := "", ""
+				last, prog, sug := "", "", ""
 				if l, ok := live[j.ID]; ok {
 					if age, ok := l.LastOutputAge(); ok {
 						last = slurm.HumanDuration(age) + " ago"
 					}
 					prog = l.ProgressText()
 				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", j.ID, j.Partition, j.Name, j.State,
-					j.Time, j.TimeLimit, j.CPUs, j.NodeList, last, prog)
+				if s, ok := suggest(j.Name); ok {
+					sug = fmt.Sprintf("%s (%s)", slurm.FormatDuration(s.Limit), slurm.Plural(s.Runs, "run"))
+					if lim := slurm.ParseDuration(j.TimeLimit); lim > 0 && lim < s.Limit {
+						sug = "! " + sug + ", limit shorter"
+					}
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", j.ID, j.Partition, j.Name, j.State,
+					j.Time, j.TimeLimit, j.CPUs, j.NodeList, last, prog, sug)
 			}
 			if len(jobs) == 0 {
 				fmt.Fprintln(w, "(no jobs)")
 			}
 			w.Flush()
+			if since != "" {
+				fmt.Printf("\nEnded since %s:\n", cutoff.Format("2006-01-02 15:04"))
+				printFinished(os.Stdout, finished)
+			}
 			fmt.Println()
 			printInfo(os.Stdout, e.Cfg.Host, info)
 			return nil
@@ -555,6 +613,7 @@ Below that come the partitions, free resources and your limits.`,
 	}
 	nameFlag(cmd, &name)
 	cmd.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
+	cmd.Flags().StringVar(&since, "since", "", "also list jobs that ended in this window: 30m, 6h, 1d, 2w or a date")
 	return cmd
 }
 
@@ -727,4 +786,43 @@ it doesn't exist. Example:
 		},
 	)
 	return cmd
+}
+
+// printFinished lists ended jobs with what they used. The peak-memory column
+// appears only if the cluster records it.
+func printFinished(out io.Writer, finished []slurm.Accounting) {
+	if len(finished) == 0 {
+		fmt.Fprintln(out, "(none)")
+		return
+	}
+	rss := false
+	for _, a := range finished {
+		rss = rss || a.MaxRSSMB >= 0
+	}
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	head := "JOBID\tNAME\tSTATE\tEXIT\tRAN / LIMIT\tCPUs\tCPU EFFICIENCY"
+	if rss {
+		head += "\tPEAK MEMORY"
+	}
+	fmt.Fprintln(w, head)
+	for _, a := range finished {
+		eff := "-"
+		if e := a.CPUEfficiency(); e >= 0 {
+			eff = fmt.Sprintf("%.0f%%", e*100)
+		}
+		row := fmt.Sprintf("%s\t%s\t%s\t%s\t%s / %s\t%d\t%s", a.ID, a.Name, a.State, a.ExitCode,
+			slurm.FormatDuration(a.Elapsed), slurm.FormatLimit(a.TimeLimit), a.AllocCPUs, eff)
+		if rss {
+			m := "-"
+			if a.MaxRSSMB >= 0 {
+				m = slurm.FormatMem(a.MaxRSSMB)
+			}
+			row += "\t" + m
+		}
+		fmt.Fprintln(w, row)
+	}
+	w.Flush()
+	if !rss {
+		fmt.Fprintln(out, "Peak memory isn't recorded by this cluster's accounting.")
+	}
 }

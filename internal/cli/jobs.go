@@ -76,19 +76,27 @@ func liveJSON(l slurm.Live, lines int) *outputJSON {
 }
 
 type jobJSON struct {
-	ID        string      `json:"id"`
-	Name      string      `json:"name"`
-	Partition string      `json:"partition"`
-	State     string      `json:"state"`
-	Time      string      `json:"time"`
-	TimeLimit string      `json:"time_limit"`
-	Nodes     string      `json:"nodes"`
-	Where     string      `json:"nodelist_or_reason"`
-	CPUs      string      `json:"cpus"`
-	Mem       string      `json:"mem"`
-	GPUs      int         `json:"gpus"`
-	ByCluster bool        `json:"submitted_by_cluster"`
-	Output    *outputJSON `json:"output,omitempty"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Partition string          `json:"partition"`
+	State     string          `json:"state"`
+	Time      string          `json:"time"`
+	TimeLimit string          `json:"time_limit"`
+	Nodes     string          `json:"nodes"`
+	Where     string          `json:"nodelist_or_reason"`
+	CPUs      string          `json:"cpus"`
+	Mem       string          `json:"mem"`
+	GPUs      int             `json:"gpus"`
+	ByCluster bool            `json:"submitted_by_cluster"`
+	Output    *outputJSON     `json:"output,omitempty"`
+	Suggested *suggestionJSON `json:"suggested_time_limit,omitempty"`
+}
+
+type suggestionJSON struct {
+	LimitS     int64 `json:"limit_s"`
+	Runs       int   `json:"based_on_runs"`
+	LongestS   int64 `json:"longest_run_s"`
+	LimitShort bool  `json:"current_limit_shorter"`
 }
 
 type finishedJSON struct {
