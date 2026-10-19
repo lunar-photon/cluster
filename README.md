@@ -36,15 +36,18 @@ An existing `cluster`, `cluster-tui` or `cluster-jupyter` in `~/.local/bin` is m
 | `cluster terminal [-g]` | **Node terminal**: allocates a node (`-g`: GPU node) and opens a shell on it |
 | `cluster terminal --mount [-g] [-b]` | **Node terminal + cluster mount**: also mounts storage at `mount_point`; `-b` opens it in your file manager |
 | `cluster jupyter [-g]` | **Jupyter session on node**: JupyterLab on a compute node, opened in your browser |
+| `cluster submit [OPTIONS] -- CMD...` | Syncs the project, runs CMD as a batch job, follows its output, fetches results |
+| `cluster logs [JOBID] [-f]` | Shows or follows any job's output, with progress and last-output age |
+| `cluster wait JOBID... \| --name GLOB` | Waits until jobs end; exits non-zero if any failed |
 | `cluster attach [JOBID]` | Reconnects to a running session |
 | `cluster ps` | Lists sessions this tool started and whether they are still running |
 | `cluster stop JOBID \| --all` | Cancels the job, closes tunnels, unmounts |
-| `cluster gc` | Cleans up ended sessions and lists leftover `cluster:*` jobs |
+| `cluster gc` | Cleans up ended sessions and lists leftover jobs `cluster` submitted |
 | `cluster setup` | Checks the cluster and offers to install tmux there |
 | `cluster mount` / `unmount` | Mounts storage with sshfs until you unmount it |
 | `cluster sync push\|pull [LOCAL] [REMOTE]` | rsync, skipping `.git`, venvs and caches |
 | `cluster exec CMD...` | Runs one command on a compute node with `srun` |
-| `cluster status` | Your jobs, then the same partition table as `cluster info` |
+| `cluster status [--since 1d] [--name GLOB]` | Your jobs with progress and suggested limits, recently ended ones, then the partition table |
 | `cluster config [show\|migrate]` | Edits, prints or converts the config |
 
 The old names still work: `cluster shell` is `cluster terminal`, and `cluster dev` is `cluster terminal --mount`.
@@ -73,11 +76,47 @@ When a node terminal starts, it prints the node's hardware and what your job was
 
 1. **Actions:** start a node terminal (with or without the cluster mount) or a Jupyter session, mount storage, sync code. Below the list, what each button will request and whether it should start right away or queue.
 2. **Cluster:** the partition table above with free-capacity bars. The selected partition's full detail appears underneath; `t` starts a node terminal there and `j` a Jupyter session, adding the QOS the partition needs and a GPU on GPU partitions.
-3. **Jobs:** your jobs with CPUs, memory, GPUs, time used and limit.
+3. **Jobs:** your jobs with cores, time used and limit, how long ago each last wrote output, and progress with an ETA. The selected job's latest output appears underneath; `l` follows it (Ctrl+C returns), `/` filters by name.
 4. **Sessions:** sessions this tool started; attach, stop or clean up.
 5. **Settings:** edit the config. Blank fields use the cluster's defaults.
 
 It refreshes every 30 seconds (`r` for now).
+
+## Batch jobs
+
+`cluster submit` runs one command as a batch job and handles the whole cycle:
+
+```bash
+cluster submit -c 4 -t 01:00:00 --fetch results/ -- python fit.py --all
+```
+
+1. It copies the project to the cluster with the `[sync]` excludes. The project is the directory holding `.cluster.toml` (see below), else the current one. It goes to `remote_path` from `.cluster.toml`, else a directory of the same name in your remote home.
+2. It checks the request against the partition and the usage rules.
+3. It submits a batch job that runs the command in that directory. The job is named after the script (`fit` here, after the job prefix) and its output goes to `.cluster-logs/` there.
+4. It prints the output as it comes, then how the job ended.
+5. It copies back the `--fetch` paths, even after a failure.
+
+Ctrl+C stops following; the job keeps running. `--detach` returns right after submitting, and `--no-follow` waits quietly. Without `-t` and with no time limit in the config, the limit comes from earlier runs with the same job name.
+
+Before anything is submitted (by `submit`, `terminal`, `jupyter`, `exec` or `setup`), the request is checked against its partition. A time limit longer than the partition allows, or a partition that doesn't exist, is refused with the fix instead of leaving a job queued that Slurm would never start.
+
+## Following jobs
+
+These work for any of your jobs, including ones another tool submitted with `sbatch`:
+
+- `cluster logs JOBID` prints the job's state, how long ago it last wrote output, its progress, and its last lines. `-f` follows the output until the job ends, then prints how it ended and exits non-zero if it failed. Without a JOBID it picks your newest job (matching `--name`).
+- `cluster wait JOBID...` (or `--name GLOB`) blocks until the jobs end, prints each one's state, exit code and run time from Slurm's accounting, and exits 1 if any failed (2 on `--timeout`). `--notify` adds a desktop notification.
+- `cluster status` shows, for running jobs, when they last wrote output and their progress. `--since 1d` adds jobs that ended in that window, with exit code, run time against the limit, CPU efficiency and peak memory where the cluster records it.
+
+**Progress.** If a job prints lines like `##progress 250/3733`, `[250/3733] ...` or tqdm's `250/3733 [`, the latest one gives a done/total count, a rate, and an estimated finish checked against the time limit: `250/3733 · 41 min left · limit OK` or `ETA past limit`. Only these forms count, so a date like 10/19 is never read as progress.
+
+**Suggested time limits.** `status` suggests a limit for each job from earlier runs with the same name. It takes the longest of the last 10 runs that completed or timed out, adds 50%, and rounds up to 5 minutes. It flags jobs whose limit is shorter than that. Taking the longest rather than the latest run keeps a quick partial rerun from lowering the limit for a full run.
+
+**Where output is.** Slurm forgets a job's output file a few minutes after it ends, and its accounting doesn't record it. `cluster` notes the path whenever it sees a job running, falls back to Slurm's default `slurm-<id>.out` in the job's directory, and takes `--path` otherwise.
+
+## Scripts and agents
+
+`status`, `info`, `ps`, `logs`, `wait` and `submit` take `--json`, with stable field names. With `-f`, `logs` and `submit` emit one JSON object per line. Without a terminal, nothing prompts. `init --yes` accepts the detected values, `setup --yes` installs tmux, node terminals point to `exec`/`submit`, and a Jupyter session stops on an interrupt instead of asking.
 
 ## Sessions and network drops
 
@@ -105,6 +144,7 @@ All ssh, rsync and sshfs calls share one OpenSSH connection (`ControlMaster`). A
 host = "hpc.example.edu"        # or user@host, or a Host alias from ~/.ssh/config
 mount_point = "~/Cluster"
 default_profile = "cpu"
+job_prefix = "cluster:"         # starts the name of every job cluster submits
 
 [slurm]                         # defaults shared by every profile
 partition = "medium"
@@ -127,6 +167,9 @@ setup = "module load anaconda3 && conda activate ml"
 
 [sync]
 exclude = [".git/", "__pycache__/", ".venv/", "*.ckpt"]
+
+[policy]                        # optional usage rules, see below
+max_cpus = 16
 ```
 
 Anything left out uses the cluster's own default: with no `partition`, jobs go to the default partition; with no `mem` or `time`, the partition's default memory and time limit apply.
@@ -134,6 +177,34 @@ Anything left out uses the cluster's own default: with no `partition`, jobs go t
 Command-line flags override environment variables (`CLUSTER_HOST`, `CLUSTER_PROFILE`), which override the profile, which overrides `[slurm]`. The file is parsed as TOML and never executed.
 
 If you used the earlier bash version, its `~/.config/cluster/config` is read until you run `cluster config migrate`.
+
+### Project settings and usage rules
+
+A project can keep its own settings in a `.cluster.toml` at its root. `cluster` finds it from any subdirectory, applies it on top of your config while you work there, and never copies it into your config:
+
+```toml
+# .cluster.toml (example)
+job_prefix  = "proj_"           # names of this project's jobs
+remote_path = "projects/proj"   # where the project lives on the cluster
+
+[slurm]                         # this project's defaults
+cpus = 8
+time = "01:00:00"
+
+[sync]
+exclude = [".git/", "data/raw/"]
+
+[policy]                        # rules for everyone working here
+job_prefix     = "proj_"        # every job name must start with this
+partitions     = ["batch", "short"]
+max_jobs       = 3              # active jobs at once (with this prefix)
+max_cpus       = 8              # per job
+max_total_cpus = 24             # across active jobs (with this prefix)
+```
+
+Every command that submits work checks the rules first and refuses with a message naming the rule, e.g. `policy: at most 3 proj_* jobs at once; 3 active (2 running, 1 pending)`. A `[policy]` in your own config applies everywhere. `cluster info` and the dashboard's Cluster tab show the rules in force and where they come from, so they're visible before anything is submitted. Jobs submitted by other tools don't go through these checks.
+
+**Job names.** Every job `cluster` submits carries a Slurm comment marking it as such, and `cluster gc` finds leftovers by that comment. So a project prefix shared with jobs from other tools never makes those jobs look like leftovers.
 
 ## Requirements
 
@@ -147,7 +218,7 @@ On the cluster: Slurm 20.11 or newer for `srun --overlap` (on older versions pas
 make test       # go vet + go test -race
 ```
 
-The lifecycle tests run against fake `ssh`, `sbatch`, `squeue`, `srun` and `scancel` scripts (`internal/lifecycle/*_test.go`). They cover normal exit, connection loss and reattach, tmux detach, closing the terminal on a busy and an idle node terminal, a job ending while disconnected, `gc`, a Jupyter tunnel being killed and restored, and Jupyter's kernel checks on Ctrl+C and terminal close. The cluster-information code is tested against synthetic `scontrol`/`sacctmgr` output covering idle, busy, down and drained nodes, GPU partitions that require a QOS, partitions you can't use, and QOS limits.
+The lifecycle tests run against fake `ssh`, `sbatch`, `squeue`, `srun` and `scancel` scripts (`internal/lifecycle/*_test.go`). They cover normal exit, connection loss and reattach, tmux detach, closing the terminal on a busy and an idle node terminal, a job ending while disconnected, `gc`, a Jupyter tunnel being killed and restored, and Jupyter's kernel checks on Ctrl+C and terminal close. `internal/lifecycle/policy_test.go` covers every usage rule and the partition time-limit check. The job-following code is tested on synthetic `scontrol`, `sacct` and log output: output paths with `%j`/`%x`, step CPU time folded into jobs, the progress forms and ETA, and the time-limit suggestion. The cluster-information code is tested against synthetic `scontrol`/`sacctmgr` output covering idle, busy, down and drained nodes, GPU partitions that require a QOS, partitions you can't use, and QOS limits.
 
 The earlier bash + C++ implementation is in `legacy/`.
 
