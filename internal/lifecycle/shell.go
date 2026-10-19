@@ -151,7 +151,7 @@ func (e *Env) StartShell(o ShellOpts) error {
 	o.Req.Name = e.Cfg.JobName(strings.ReplaceAll(string(sess.Kind), "+", "-"))
 	{
 		ctx, cancel := timeout(30 * time.Second)
-		err := e.CheckPolicy(ctx, o.Req)
+		err := e.CheckRequest(ctx, o.Req)
 		cancel()
 		if err != nil {
 			return err

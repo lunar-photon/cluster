@@ -446,6 +446,14 @@ are skipped.`,
 			src, dst := abs+"/", e.Cfg.Host+":"+remoteDir+"/"
 			if action == "pull" {
 				src, dst = dst, src
+			} else if !preview && !g.dryRun {
+				// rsync creates only the last directory level itself.
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_, err := e.R.Output(ctx, "mkdir -p "+remoteDirExpr(remoteDir), nil)
+				cancel()
+				if err != nil {
+					return err
+				}
 			}
 			fmt.Printf("%s -> %s\n", src, dst)
 			return e.R.Local("rsync", append(rargs, src, dst)...)
@@ -655,7 +663,7 @@ it with cluster logs -f.`,
 			req.Name = e.Cfg.JobName("exec")
 			{
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				err := e.CheckPolicy(ctx, req)
+				err := e.CheckRequest(ctx, req)
 				cancel()
 				if err != nil {
 					return err

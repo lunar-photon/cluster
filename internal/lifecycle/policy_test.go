@@ -59,3 +59,31 @@ func TestPolicyRefusesBeforeSubmitting(t *testing.T) {
 		t.Error("nothing may be submitted when the policy refuses")
 	}
 }
+
+// fakeScontrol knows one partition, "medium", with a 1-hour limit.
+const fakeScontrol = `#!/usr/bin/env bash
+if [[ "$1 $2" == "show partition" ]]; then
+  if [[ "$4" == medium ]]; then echo "PartitionName=medium MaxTime=01:00:00 State=UP"; exit 0; fi
+  echo "Partition $4 not found"; exit 1  # scontrol says this on stdout
+fi
+exit 1
+`
+
+func TestCheckRequestPartitionLimits(t *testing.T) {
+	f := newFake(t)
+	os.WriteFile(filepath.Join(f.dir, "bin", "scontrol"), []byte(fakeScontrol), 0o755)
+	ctx := context.Background()
+	req := func(part, tm string) slurm.Request {
+		return slurm.Request{Name: "x", Slurm: config.Slurm{Partition: part, Time: tm, CPUs: 1}}
+	}
+	if err := f.env.CheckRequest(ctx, req("medium", "00:30:00")); err != nil {
+		t.Errorf("within the limit: %v", err)
+	}
+	err := f.env.CheckRequest(ctx, req("medium", "04:00:00"))
+	if err == nil || !strings.Contains(err.Error(), "partition medium allows at most 01:00:00 per job, but this asks for 04:00:00; pass -t 01:00:00 or less") {
+		t.Errorf("over the limit: %v", err)
+	}
+	if err := f.env.CheckRequest(ctx, req("nosuch", "")); err == nil || !strings.Contains(err.Error(), `no partition "nosuch"`) {
+		t.Errorf("unknown partition: %v", err)
+	}
+}

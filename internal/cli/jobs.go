@@ -26,6 +26,29 @@ import (
 // errJobFailed makes a command exit non-zero after it has printed why.
 var errJobFailed = errors.New("job did not complete successfully")
 
+// errInterrupted reports that the user stopped waiting (the job continues).
+var errInterrupted = errors.New("interrupted")
+
+// runWaitQuiet waits for one job to leave the queue, without printing.
+func runWaitQuiet(e *lifecycle.Env, id string) error {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, alive, err := e.Slurm.Alive(ctx, id)
+		cancel()
+		if err == nil && !alive {
+			return nil
+		}
+		select {
+		case <-sig:
+			return errInterrupted
+		case <-time.After(15 * time.Second):
+		}
+	}
+}
+
 func printJSON(v any) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
@@ -430,8 +453,13 @@ func endedText(a slurm.Accounting) string {
 // followOutput streams the file with `tail -F` until the job ends or the
 // user presses Ctrl+C. The remote side ends tail when our stdin closes, so
 // no tail is left behind on the login node.
+// n < 0 prints the whole file from its start.
 func followOutput(e *lifecycle.Env, id, path string, n int, out io.Writer) (interrupted bool, err error) {
-	script := "tail -n " + strconv.Itoa(n) + " -F -- " + remote.Quote(path) + " 2>/dev/null & t=$!; cat >/dev/null; kill $t 2>/dev/null"
+	from := strconv.Itoa(n)
+	if n < 0 {
+		from = "+1"
+	}
+	script := "tail -n " + from + " -F -- " + remote.Quote(path) + " 2>/dev/null & t=$!; cat >/dev/null; kill $t 2>/dev/null"
 	cmd := e.R.Command([]string{"-T", "-o", "BatchMode=yes"}, script)
 	cmd.Stdout, cmd.Stderr = out, os.Stderr
 	stdin, err := cmd.StdinPipe()

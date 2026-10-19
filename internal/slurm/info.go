@@ -629,3 +629,25 @@ func CompressHosts(names []string) string {
 	sort.Strings(plain)
 	return strings.Join(append(parts, plain...), ",")
 }
+
+// partitionMissing matches scontrol's message for an unknown partition.
+var partitionMissing = regexp.MustCompile(`Partition \S+ not found|Invalid partition`)
+
+// PartitionLimits reads one partition (the default one when name is empty).
+// found is false when the cluster has no such partition.
+func (c *Client) PartitionLimits(ctx context.Context, name string) (p *PartitionInfo, found bool, err error) {
+	if name == "" {
+		if name, err = c.DefaultPartition(ctx); err != nil || name == "" {
+			return nil, false, err
+		}
+	}
+	out, err := c.R.Run(ctx, "scontrol", "show", "partition", "-o", name)
+	if err != nil {
+		if partitionMissing.MatchString(err.Error() + " " + out) { // scontrol prints it on stdout
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	p = parsePartition(keyValues(strings.TrimSpace(out)))
+	return p, p.Name != "", nil
+}

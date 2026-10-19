@@ -240,7 +240,7 @@ func tmuxBuildRequest(e *lifecycle.Env) (slurm.Request, error) {
 func buildTmux(e *lifecycle.Env, req slurm.Request) error {
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := e.CheckPolicy(ctx, req)
+		err := e.CheckRequest(ctx, req)
 		cancel()
 		if err != nil {
 			return err

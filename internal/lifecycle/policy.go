@@ -2,12 +2,48 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/lunar-photon/cluster/internal/remote"
 	"github.com/lunar-photon/cluster/internal/slurm"
 )
+
+// CheckRequest is what every command runs before submitting: the request
+// must fit the partition (so it can ever start) and the usage rules.
+func (e *Env) CheckRequest(ctx context.Context, req slurm.Request) error {
+	if err := e.checkPartition(ctx, req); err != nil {
+		return err
+	}
+	return e.CheckPolicy(ctx, req)
+}
+
+// checkPartition refuses requests Slurm would accept but never start, such
+// as a time limit longer than the partition allows. If the partition can't
+// be read (an unusual Slurm setup), it lets the request through.
+func (e *Env) checkPartition(ctx context.Context, req slurm.Request) error {
+	if e.R.DryRun {
+		return nil
+	}
+	p, found, err := e.Slurm.PartitionLimits(ctx, req.Partition)
+	switch {
+	case errors.Is(err, remote.ErrConnection):
+		return err
+	case err != nil:
+		return nil
+	case !found && req.Partition != "":
+		return fmt.Errorf("the cluster has no partition %q (cluster info lists them)", req.Partition)
+	case !found:
+		return nil
+	}
+	if want, max := slurm.ParseDuration(req.Time), slurm.ParseDuration(p.MaxTime); want > 0 && max > 0 && want > max {
+		return fmt.Errorf("partition %s allows at most %s per job, but this asks for %s; pass -t %s or less",
+			p.Name, slurm.FormatDuration(max), slurm.FormatDuration(want), slurm.FormatDuration(max))
+	}
+	return nil
+}
 
 // PolicyError is a request the configured usage rules don't allow.
 type PolicyError struct{ Msg string }

@@ -163,6 +163,7 @@ Run with no arguments in a terminal to open the dashboard.`,
 		setupCmd(g),
 		infoCmd(g),
 		logsCmd(g),
+		submitCmd(g),
 		waitCmd(g),
 		&cobra.Command{
 			Use:   "connect",
