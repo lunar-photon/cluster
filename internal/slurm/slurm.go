@@ -11,19 +11,26 @@ import (
 	"github.com/lunar-photon/cluster/internal/remote"
 )
 
-// JobPrefix names every job this tool submits, so orphans can be found.
-const JobPrefix = "cluster:"
+// Marker is the Slurm comment on every job this tool submits. `cluster gc`
+// finds leftovers by it rather than by name, so jobs that merely share the
+// configured name prefix (e.g. a project's own sbatch jobs) are never touched.
+const Marker = "submitted-by-cluster"
 
 // Request is a resource request; Args is the only place Slurm flags are built.
 type Request struct {
 	config.Slurm
 	Name string
+	// NoMarker leaves out the --comment marker (for tests of the flag set).
+	NoMarker bool
 }
 
 func (r Request) Args() []string {
 	var a []string
 	if r.Name != "" {
 		a = append(a, "--job-name="+r.Name)
+	}
+	if !r.NoMarker {
+		a = append(a, "--comment="+Marker)
 	}
 	if r.Partition != "" {
 		a = append(a, "--partition="+r.Partition)
@@ -65,7 +72,11 @@ type Job struct {
 	CPUs      string
 	Mem       string // minimum memory requested, e.g. "8G"; "0" means the default
 	GRES      string // e.g. "gres:gpu:1"; "N/A" when none
+	Comment   string
 }
+
+// ByCluster reports whether this tool submitted the job.
+func (j Job) ByCluster() bool { return j.Comment == Marker }
 
 // GPUs is the number of GPUs the job requested per node.
 func (j Job) GPUs() int { return gresGPUs(j.GRES) }
@@ -93,7 +104,7 @@ func New(r *remote.Client) *Client { return &Client{R: r} }
 
 const sep = "\x1f" // ASCII unit separator: cannot appear in job names typed at a shell
 
-var squeueFormat = strings.Join([]string{"%i", "%P", "%j", "%u", "%T", "%M", "%l", "%D", "%R", "%C", "%m", "%b"}, sep)
+var squeueFormat = strings.Join([]string{"%i", "%P", "%j", "%u", "%T", "%M", "%l", "%D", "%R", "%C", "%m", "%b", "%k"}, sep)
 
 // Jobs lists the current user's jobs. With ids, it lists only those jobs.
 func (c *Client) Jobs(ctx context.Context, ids ...string) ([]Job, error) {
@@ -123,6 +134,9 @@ func parseSqueueText(out string) []Job {
 			TimeLimit: f[6], Nodes: f[7], NodeList: f[8]}
 		if len(f) >= 12 {
 			j.CPUs, j.Mem, j.GRES = f[9], f[10], f[11]
+		}
+		if len(f) >= 13 {
+			j.Comment = f[12]
 		}
 		jobs = append(jobs, j)
 	}

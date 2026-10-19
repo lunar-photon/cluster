@@ -98,7 +98,7 @@ func (e *Env) Jupyter(o JupyterOpts) error {
 		return err
 	}
 
-	o.Req.Name = slurm.JobPrefix + "jupyter"
+	o.Req.Name = e.Cfg.JobName("jupyter")
 	id, err := e.Slurm.Submit(ctx, o.Req, jupyterScript(e.Cfg.Jupyter.Setup, o.Dir, token),
 		"--output=.cluster/jupyter-%j.log")
 	if err != nil {

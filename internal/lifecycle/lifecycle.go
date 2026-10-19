@@ -275,8 +275,9 @@ func (e *Env) Sessions(ctx context.Context) ([]Status, error) {
 }
 
 // GC forgets sessions whose jobs have ended, unmounting what they mounted,
-// and reports (or with cancel, cancels) running jobs named cluster:* that no
-// tracked session owns — e.g. from a machine that crashed.
+// and reports (or with cancel, cancels) running jobs this tool submitted
+// (by their comment marker) that no tracked session owns — e.g. from a
+// machine that crashed.
 func (e *Env) GC(cancelUntracked bool) error {
 	if err := e.R.EnsureMaster(); err != nil {
 		return err
@@ -308,7 +309,7 @@ func (e *Env) GC(cancelUntracked bool) error {
 	}
 	var orphans []string
 	for _, j := range jobs {
-		if len(j.Name) > len(slurm.JobPrefix) && j.Name[:len(slurm.JobPrefix)] == slurm.JobPrefix && !tracked[j.ID] && slurm.IsActive(j.State) {
+		if j.ByCluster() && !tracked[j.ID] && slurm.IsActive(j.State) {
 			orphans = append(orphans, j.ID)
 			e.printf("Untracked job %s (%s, %s, %s)\n", j.ID, j.Name, j.State, j.NodeList)
 		}

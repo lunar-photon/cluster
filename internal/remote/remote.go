@@ -83,7 +83,10 @@ func New(host string) *Client {
 
 // SSHOptions are the -o flags shared by every ssh-based tool.
 func (c *Client) SSHOptions() []string {
-	opts := []string{"-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10"}
+	// LogLevel=ERROR hides per-connection notices (e.g. a server's key-exchange
+	// warning) on every call; real failures and host-key mismatches are errors
+	// and still show. `cluster setup` reports such notices once.
+	opts := []string{"-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR"}
 	if c.ControlPath != "" {
 		opts = append(opts,
 			"-o", "ControlMaster=auto",
@@ -297,9 +300,27 @@ func (c *Client) Tunnel(localPort int, target string, targetPort int) *exec.Cmd 
 		"-o", "ServerAliveInterval=15",
 		"-o", "ServerAliveCountMax=3",
 		"-o", "ConnectTimeout=10",
+		"-o", "LogLevel=ERROR",
 		"-L", fmt.Sprintf("127.0.0.1:%d:%s:%d", localPort, target, targetPort),
 		c.Host,
 	}
 	c.trace(c.SSH, args)
 	return exec.Command(c.SSH, args...)
+}
+
+// Notices opens one fresh, non-multiplexed connection at the normal log level
+// and returns what ssh printed besides errors (e.g. warnings from the server).
+func (c *Client) Notices(ctx context.Context) []string {
+	cmd := exec.CommandContext(ctx, c.SSH, "-o", "ControlPath=none", "-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=10", c.Host, "true")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	_ = cmd.Run()
+	var out []string
+	for _, line := range strings.Split(stderr.String(), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }

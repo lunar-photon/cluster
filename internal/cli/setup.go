@@ -130,6 +130,17 @@ func runSetup(e *lifecycle.Env, yes, skipTmux, reinstall bool) error {
 	if err := e.R.EnsureMaster(); err != nil {
 		return err
 	}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		notices := e.R.Notices(ctx)
+		cancel()
+		if len(notices) > 0 {
+			fmt.Println("  ssh:     the server prints these on every connection (cluster hides them):")
+			for _, n := range notices {
+				fmt.Println("           " + n)
+			}
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	out, err := e.R.Output(ctx, "bash -s", strings.NewReader(probeScript))
 	cancel()
@@ -223,7 +234,7 @@ func tmuxBuildRequest(e *lifecycle.Env) (slurm.Request, error) {
 		return slurm.Request{}, err
 	}
 	base.CPUs, base.Mem, base.Time, base.GPUs = 4, "2G", "00:20:00", 0
-	return slurm.Request{Slurm: base, Name: slurm.JobPrefix + "setup"}, nil
+	return slurm.Request{Slurm: base, Name: e.Cfg.JobName("setup")}, nil
 }
 
 func buildTmux(e *lifecycle.Env, req slurm.Request) error {

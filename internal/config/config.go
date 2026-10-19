@@ -90,6 +90,8 @@ type Config struct {
 	Profiles       map[string]Slurm `toml:"profiles,omitempty"`
 	Jupyter        Jupyter          `toml:"jupyter"`
 	Sync           Sync             `toml:"sync"`
+	// JobPrefix starts the name of every job cluster submits.
+	JobPrefix string `toml:"job_prefix,omitempty"`
 
 	// Path is where the config was loaded from (or will be saved to).
 	Path string `toml:"-"`
@@ -97,6 +99,18 @@ type Config struct {
 	Legacy bool `toml:"-"`
 	// Source is the file the values were read from; empty for built-in defaults.
 	Source string `toml:"-"`
+}
+
+// DefaultJobPrefix names jobs when the config sets no job_prefix.
+const DefaultJobPrefix = "cluster:"
+
+// JobName is the Slurm job name for a kind of job, e.g. "cluster:terminal".
+func (c Config) JobName(kind string) string {
+	prefix := c.JobPrefix
+	if prefix == "" {
+		prefix = DefaultJobPrefix
+	}
+	return prefix + kind
 }
 
 var DefaultSyncExcludes = []string{
@@ -118,8 +132,9 @@ func Defaults() Config {
 			"cpu": {},
 			"gpu": {GPUs: 1},
 		},
-		Jupyter: Jupyter{Port: 8888},
-		Sync:    Sync{Exclude: DefaultSyncExcludes},
+		Jupyter:   Jupyter{Port: 8888},
+		Sync:      Sync{Exclude: DefaultSyncExcludes},
+		JobPrefix: DefaultJobPrefix,
 	}
 }
 
@@ -195,6 +210,9 @@ func overlay(base, file Config) Config {
 	out := base
 	if file.Host != "" {
 		out.Host = file.Host
+	}
+	if file.JobPrefix != "" {
+		out.JobPrefix = file.JobPrefix
 	}
 	if file.MountPoint != "" {
 		out.MountPoint = file.MountPoint

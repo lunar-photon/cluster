@@ -9,7 +9,7 @@ import (
 )
 
 func TestRequestArgs(t *testing.T) {
-	r := Request{Name: "cluster:terminal", Slurm: config.Slurm{
+	r := Request{Name: "cluster:terminal", NoMarker: true, Slurm: config.Slurm{
 		Partition: "gpu", Account: "lab", QOS: "gpu_qos", CPUs: 8, Mem: "16G", Time: "02:00:00", GPUs: 2,
 		Extra: []string{"--constraint=a100"},
 	}}
@@ -20,8 +20,11 @@ func TestRequestArgs(t *testing.T) {
 	if got := r.Args(); !reflect.DeepEqual(got, want) {
 		t.Errorf("got  %v\nwant %v", got, want)
 	}
-	if got := (Request{}).Args(); len(got) != 0 {
+	if got := (Request{NoMarker: true}).Args(); len(got) != 0 {
 		t.Errorf("empty request should add no flags: %v", got)
+	}
+	if got := (Request{}).Args(); !reflect.DeepEqual(got, []string{"--comment=" + Marker}) {
+		t.Errorf("every submitted job carries the marker: %v", got)
 	}
 }
 

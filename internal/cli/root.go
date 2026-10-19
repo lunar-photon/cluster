@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -46,7 +47,7 @@ func (g *globals) env() (*lifecycle.Env, error) {
 	if cfg.Host == "" {
 		return nil, fmt.Errorf("no cluster host configured: run `cluster init`, pass --host, or set CLUSTER_HOST")
 	}
-	if cfg.Legacy {
+	if cfg.Legacy && onceADay("legacy-config-note") {
 		fmt.Fprintf(os.Stderr, "Note: using the old shell-style config; run `cluster config migrate` to switch to %s.\n", cfg.Path)
 	}
 	r := remote.New(cfg.Host)
@@ -214,4 +215,16 @@ func Execute() int {
 		return 1
 	}
 	return 0
+}
+
+// onceADay reports true at most once every 24 hours per name, using a stamp
+// file in the state directory. If the stamp can't be written it says true.
+func onceADay(name string) bool {
+	stamp := filepath.Join(session.Dir(), "."+name)
+	if st, err := os.Stat(stamp); err == nil && time.Since(st.ModTime()) < 24*time.Hour {
+		return false
+	}
+	_ = os.MkdirAll(session.Dir(), 0o700)
+	_ = os.WriteFile(stamp, nil, 0o600)
+	return true
 }

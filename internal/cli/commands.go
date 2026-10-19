@@ -16,7 +16,6 @@ import (
 	"github.com/lunar-photon/cluster/internal/lifecycle"
 	"github.com/lunar-photon/cluster/internal/mount"
 	"github.com/lunar-photon/cluster/internal/remote"
-	"github.com/lunar-photon/cluster/internal/slurm"
 )
 
 type persistFlags struct {
@@ -230,7 +229,7 @@ func gcCmd(g *globals) *cobra.Command {
 			return e.GC(cancelUntracked)
 		},
 	}
-	cmd.Flags().BoolVar(&cancelUntracked, "cancel-untracked", false, "also cancel running cluster:* jobs not tracked on this machine")
+	cmd.Flags().BoolVar(&cancelUntracked, "cancel-untracked", false, "also cancel running jobs submitted by cluster that aren't tracked on this machine")
 	return cmd
 }
 
@@ -447,7 +446,8 @@ func progressFlag() string {
 }
 
 func statusCmd(g *globals) *cobra.Command {
-	return &cobra.Command{
+	var name string
+	cmd := &cobra.Command{
 		Use:     "status",
 		Aliases: []string{"stat", "queue", "q"},
 		Short:   "Show your jobs, then partitions, free resources and your limits",
@@ -466,6 +466,7 @@ func statusCmd(g *globals) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			jobs = filterJobs(jobs, name)
 			info, err := e.Slurm.ClusterInfo(ctx)
 			if err != nil {
 				return err
@@ -487,6 +488,8 @@ func statusCmd(g *globals) *cobra.Command {
 			return nil
 		},
 	}
+	nameFlag(cmd, &name)
+	return cmd
 }
 
 func execCmd(g *globals) *cobra.Command {
@@ -501,7 +504,11 @@ Options must come before the command. A single argument is run as a shell
 command line (so pipes work); several arguments are run as an argv:
 
   cluster exec "nvidia-smi | head"
-  cluster exec -g python train.py --lr 0.1`,
+  cluster exec -g python train.py --lr 0.1
+
+exec holds its allocation only while this connection stays open. For work
+longer than a few minutes, submit a batch job with cluster submit and follow
+it with cluster logs -f.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			e, err := g.env()
@@ -519,7 +526,7 @@ command line (so pipes work); several arguments are run as an argv:
 			if err := e.R.EnsureMaster(); err != nil {
 				return err
 			}
-			req.Name = slurm.JobPrefix + "exec"
+			req.Name = e.Cfg.JobName("exec")
 			argv := append(append([]string{"srun"}, req.Args()...), "bash", "-lc", line)
 			fmt.Fprintf(os.Stderr, "srun %s\n", req)
 			err = e.R.Interactive(remote.Join(argv...))

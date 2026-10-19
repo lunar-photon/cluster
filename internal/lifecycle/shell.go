@@ -169,7 +169,7 @@ func (e *Env) StartShell(o ShellOpts) error {
 	}
 
 	ctx, cancel := timeout(60 * time.Second)
-	o.Req.Name = slurm.JobPrefix + strings.ReplaceAll(string(sess.Kind), "+", "-")
+	o.Req.Name = e.Cfg.JobName(strings.ReplaceAll(string(sess.Kind), "+", "-"))
 	id, err := e.Slurm.Submit(ctx, o.Req, holdScript(o.Persist), "--output=/dev/null")
 	cancel()
 	if err != nil {

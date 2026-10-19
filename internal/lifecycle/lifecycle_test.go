@@ -52,7 +52,7 @@ for f in "$FAKE"/job_*; do
   [[ -f "$f" ]] || continue
   j="${f##*/job_}"
   [[ -n "$id" && "$j" != "$id" ]] && continue
-  echo "$j${us}medium${us}cluster:terminal${us}me${us}$(cat "$f")${us}0:05${us}4:00:00${us}1${us}node07${us}4${us}8G${us}N/A"
+  echo "$j${us}medium${us}cluster:terminal${us}me${us}$(cat "$f")${us}0:05${us}4:00:00${us}1${us}node07${us}4${us}8G${us}N/A${us}submitted-by-cluster"
 done
 `
 
