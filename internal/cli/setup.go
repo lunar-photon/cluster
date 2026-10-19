@@ -216,7 +216,7 @@ usually 2-3 minutes). The result uses about 2 MB.
 	}
 	if !yes && !reinstall {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			fmt.Println("Run `cluster setup` in a terminal to install it.")
+			fmt.Println("Not asking without a terminal; run `cluster setup --yes` to install it.")
 			return nil
 		}
 		if !confirm("Install tmux on the cluster? [Y/n] ", true) {

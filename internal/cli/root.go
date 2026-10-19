@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -161,6 +162,8 @@ Run with no arguments in a terminal to open the dashboard.`,
 		initCmd(g),
 		setupCmd(g),
 		infoCmd(g),
+		logsCmd(g),
+		waitCmd(g),
 		&cobra.Command{
 			Use:   "connect",
 			Short: "Open the shared ssh connection (prompts for password/2FA if needed)",
@@ -211,7 +214,9 @@ func runTUI(g *globals) error {
 
 func Execute() int {
 	if err := NewRoot().Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
+		if !errors.Is(err, errJobFailed) { // already reported with the job's state
+			fmt.Fprintln(os.Stderr, "Error:", err)
+		}
 		return 1
 	}
 	return 0

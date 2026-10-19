@@ -72,6 +72,11 @@ func (e *Env) notify(msg string) {
 	if e.NoDesktopNotify {
 		return
 	}
+	DesktopNotify(msg)
+}
+
+// DesktopNotify shows a desktop notification if the platform has a way to.
+func DesktopNotify(msg string) {
 	var cmd *exec.Cmd
 	switch {
 	case runtime.GOOS == "darwin":

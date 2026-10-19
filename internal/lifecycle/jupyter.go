@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/lunar-photon/cluster/internal/remote"
 	"github.com/lunar-photon/cluster/internal/session"
 	"github.com/lunar-photon/cluster/internal/slurm"
@@ -264,6 +266,9 @@ func (e *Env) keepJupyter(sess session.Session, sig os.Signal) bool {
 		what := fmt.Sprintf("%d kernel(s) are running", n)
 		if err != nil {
 			what = "Couldn't check for running kernels"
+		}
+		if f, ok := e.In.(*os.File); ok && !term.IsTerminal(int(f.Fd())) {
+			return false // no one to ask: an interrupt from a script means stop
 		}
 		e.printf("\n%s. Stopping Jupyter loses their variables (saved notebooks are kept). Stop anyway? [y/N] ", what)
 		line, _ := bufio.NewReader(e.In).ReadString('\n')

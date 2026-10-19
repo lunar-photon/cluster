@@ -11,11 +11,13 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/lunar-photon/cluster/internal/config"
 	"github.com/lunar-photon/cluster/internal/lifecycle"
 	"github.com/lunar-photon/cluster/internal/mount"
 	"github.com/lunar-photon/cluster/internal/remote"
+	"github.com/lunar-photon/cluster/internal/slurm"
 )
 
 type persistFlags struct {
@@ -67,6 +69,9 @@ with Ctrl+b d, and come back later with cluster attach.`,
 			}
 			if remoteDir == "" {
 				remoteDir = e.Cfg.RemoteDir
+			}
+			if !g.dryRun && !term.IsTerminal(int(os.Stdin.Fd())) {
+				return fmt.Errorf("a node terminal needs an interactive terminal; from scripts use cluster exec or cluster submit")
 			}
 			mountToo := alwaysMount || withMount || browse || cmd.Flags().Changed("dir")
 			return e.StartShell(lifecycle.ShellOpts{
@@ -124,7 +129,8 @@ func attachCmd(g *globals) *cobra.Command {
 }
 
 func psCmd(g *globals) *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	cmd := &cobra.Command{
 		Use:   "ps",
 		Short: "List sessions started by cluster and whether they are still running",
 		Args:  cobra.NoArgs,
@@ -141,6 +147,21 @@ func psCmd(g *globals) *cobra.Command {
 			list, err := e.Sessions(ctx)
 			if err != nil {
 				return err
+			}
+			if asJSON {
+				out := []map[string]any{}
+				for _, s := range list {
+					state := s.Job.State
+					if s.Err != nil {
+						state = "UNKNOWN"
+					} else if !s.Alive {
+						state = "ENDED"
+					}
+					out = append(out, map[string]any{"job_id": s.JobID, "kind": s.Kind, "profile": s.Profile,
+						"state": state, "node": firstNonEmpty(s.Job.NodeList, s.Node), "created": s.Created.Format(time.RFC3339),
+						"mount": s.Mount, "url": s.URL})
+				}
+				return printJSON(map[string]any{"sessions": out})
 			}
 			if len(list) == 0 {
 				fmt.Println("No sessions.")
@@ -178,6 +199,8 @@ func psCmd(g *globals) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
+	return cmd
 }
 
 func stopCmd(g *globals) *cobra.Command {
@@ -447,11 +470,16 @@ func progressFlag() string {
 
 func statusCmd(g *globals) *cobra.Command {
 	var name string
+	var asJSON bool
 	cmd := &cobra.Command{
 		Use:     "status",
 		Aliases: []string{"stat", "queue", "q"},
-		Short:   "Show your jobs, then partitions, free resources and your limits",
-		Args:    cobra.NoArgs,
+		Short:   "Show your jobs with their progress, then partitions and your limits",
+		Long: `Show your queued and running jobs. For running jobs it also shows how long
+ago they last wrote output, and their progress and estimated finish when
+they print lines such as "##progress 250/3733" (see cluster logs --help).
+Below that come the partitions, free resources and your limits.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			e, err := g.env()
 			if err != nil {
@@ -460,13 +488,29 @@ func statusCmd(g *globals) *cobra.Command {
 			if err := e.R.EnsureMaster(); err != nil {
 				return err
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			jobs, err := e.Slurm.Jobs(ctx)
 			if err != nil {
 				return err
 			}
 			jobs = filterJobs(jobs, name)
+			live := map[string]slurm.Live{}
+			var running []string
+			for _, j := range jobs {
+				if j.State == "RUNNING" {
+					running = append(running, j.ID)
+				}
+			}
+			if len(running) > 0 {
+				ls, err := e.Slurm.LiveJobs(ctx, running...)
+				if err == nil {
+					rememberPaths(ls)
+					for _, l := range ls {
+						live[l.ID] = l
+					}
+				}
+			}
 			info, err := e.Slurm.ClusterInfo(ctx)
 			if err != nil {
 				return err
@@ -474,10 +518,31 @@ func statusCmd(g *globals) *cobra.Command {
 			if p, err := e.Cfg.Profile(""); err == nil {
 				info.PreferredQOS = p.QOS
 			}
+			if asJSON {
+				out := []jobJSON{}
+				for _, j := range jobs {
+					jj := jobJSON{ID: j.ID, Name: j.Name, Partition: j.Partition, State: j.State, Time: j.Time,
+						TimeLimit: j.TimeLimit, Nodes: j.Nodes, Where: j.NodeList, CPUs: j.CPUs, Mem: j.Mem,
+						GPUs: j.GPUs(), ByCluster: j.ByCluster()}
+					if l, ok := live[j.ID]; ok {
+						jj.Output = liveJSON(l, 0)
+					}
+					out = append(out, jj)
+				}
+				return printJSON(map[string]any{"jobs": out, "cluster": clusterJSON(e.Cfg.Host, info)})
+			}
 			w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(w, "JOBID\tPARTITION\tNAME\tSTATE\tTIME\tLIMIT\tNODES\tNODELIST(REASON)")
+			fmt.Fprintln(w, "JOBID\tPARTITION\tNAME\tSTATE\tTIME\tLIMIT\tCPUs\tNODELIST(REASON)\tLAST OUTPUT\tPROGRESS")
 			for _, j := range jobs {
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", j.ID, j.Partition, j.Name, j.State, j.Time, j.TimeLimit, j.Nodes, j.NodeList)
+				last, prog := "", ""
+				if l, ok := live[j.ID]; ok {
+					if age, ok := l.LastOutputAge(); ok {
+						last = slurm.HumanDuration(age) + " ago"
+					}
+					prog = l.ProgressText()
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", j.ID, j.Partition, j.Name, j.State,
+					j.Time, j.TimeLimit, j.CPUs, j.NodeList, last, prog)
 			}
 			if len(jobs) == 0 {
 				fmt.Fprintln(w, "(no jobs)")
@@ -489,6 +554,7 @@ func statusCmd(g *globals) *cobra.Command {
 		},
 	}
 	nameFlag(cmd, &name)
+	cmd.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
 	return cmd
 }
 

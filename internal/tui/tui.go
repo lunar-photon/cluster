@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/lunar-photon/cluster/internal/lifecycle"
 	"github.com/lunar-photon/cluster/internal/mount"
 	"github.com/lunar-photon/cluster/internal/remote"
+	"github.com/lunar-photon/cluster/internal/session"
 	"github.com/lunar-photon/cluster/internal/slurm"
 )
 
@@ -58,6 +60,7 @@ var actions = []action{
 
 type refreshMsg struct {
 	jobs     []slurm.Job
+	live     map[string]slurm.Live
 	info     *slurm.Info
 	sessions []lifecycle.Status
 	err      error
@@ -166,6 +169,10 @@ type model struct {
 	errMsg  string
 	inputs  []textinput.Model
 	editing bool
+
+	live      map[string]slurm.Live // output state of running jobs
+	filter    textinput.Model       // job-name glob for the Jobs tab
+	filtering bool
 }
 
 // Run starts the dashboard. r may be nil when no host is configured.
@@ -183,6 +190,10 @@ func Run(cfg config.Config, r *remote.Client, self string) error {
 		ti.SetValue(f.get(&m.cfg))
 		m.inputs[i] = ti
 	}
+	m.filter = textinput.New()
+	m.filter.Prompt = "/"
+	m.filter.Placeholder = "name glob, e.g. proj_*"
+	m.filter.CharLimit = 128
 	if m.env == nil {
 		m.tab = tabSettings
 		m.status = "No cluster host configured — fill in Host and press Ctrl+S (or run `cluster init`)."
@@ -219,6 +230,27 @@ func (m *model) refresh() tea.Cmd {
 		defer cancel()
 		var msg refreshMsg
 		msg.jobs, msg.err = env.Slurm.Jobs(ctx)
+		if msg.err == nil {
+			var running []string
+			for _, j := range msg.jobs {
+				if j.State == "RUNNING" {
+					running = append(running, j.ID)
+				}
+			}
+			if len(running) > 0 {
+				if ls, err := env.Slurm.LiveJobs(ctx, running...); err == nil {
+					msg.live = map[string]slurm.Live{}
+					paths := map[string]session.LogPath{}
+					for _, l := range ls {
+						msg.live[l.ID] = l
+						if l.StdOut != "" {
+							paths[l.ID] = session.LogPath{Path: l.StdOut, Name: l.Name, Seen: time.Now()}
+						}
+					}
+					_ = session.DefaultLogCache().Remember(paths)
+				}
+			}
+		}
 		if msg.err == nil {
 			msg.info, msg.err = env.Slurm.ClusterInfo(ctx)
 			if msg.info != nil {
@@ -260,7 +292,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.connected = true
 			m.errMsg = ""
-			m.jobs, m.info = msg.jobs, msg.info
+			m.jobs, m.info, m.live = msg.jobs, msg.info, msg.live
 			m.sums = m.info.Summarize()
 		}
 		m.sessions = msg.sessions
@@ -279,6 +311,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if m.editing {
 			return m.updateEditing(msg)
+		}
+		if m.filtering {
+			return m.updateFilter(msg)
 		}
 		return m.updateKeys(msg)
 	}
@@ -336,6 +371,20 @@ func (m model) updateKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "j":
 			return m.inPartition(s, "Jupyter on "+s.Name, "jupyter")
 		}
+	case tabJobs:
+		if key == "/" {
+			m.filtering = true
+			return m, m.filter.Focus()
+		}
+		jobs := m.visibleJobs()
+		if len(jobs) == 0 {
+			break
+		}
+		j := jobs[m.cursor[tabJobs]]
+		switch key {
+		case "enter", "l":
+			return m, m.run("Following job "+j.ID, "logs", "-f", j.ID)
+		}
 	case tabSessions:
 		if len(m.sessions) == 0 {
 			break
@@ -376,6 +425,38 @@ func (m model) inPartition(s slurm.Summary, what, sub string) (tea.Model, tea.Cm
 		args = append(args, "--gpus", "1")
 	}
 	return m, m.run(what, args...)
+}
+
+// updateFilter edits the Jobs tab's name filter; enter or esc finishes.
+func (m model) updateFilter(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch k.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+	case "enter", "esc":
+		m.filtering = false
+		m.filter.Blur()
+		m.cursor[tabJobs] = 0
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.filter, cmd = m.filter.Update(k)
+	m.cursor[tabJobs] = 0
+	return m, cmd
+}
+
+// visibleJobs are the jobs matching the Jobs tab's filter.
+func (m model) visibleJobs() []slurm.Job {
+	pattern := strings.TrimSpace(m.filter.Value())
+	if pattern == "" {
+		return m.jobs
+	}
+	var out []slurm.Job
+	for _, j := range m.jobs {
+		if ok, err := path.Match(pattern, j.Name); err == nil && ok {
+			out = append(out, j)
+		}
+	}
+	return out
 }
 
 func (m model) updateEditing(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -459,7 +540,7 @@ func (m model) runAction(a action) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) clampCursors() {
-	limits := [numTabs]int{len(actions), len(m.sums), len(m.jobs), len(m.sessions), len(fields)}
+	limits := [numTabs]int{len(actions), len(m.sums), len(m.visibleJobs()), len(m.sessions), len(fields)}
 	for i, n := range limits {
 		if m.cursor[i] >= n {
 			m.cursor[i] = max(0, n-1)
@@ -570,6 +651,11 @@ func (m model) help() string {
 		return "↑↓ select · enter run · letter shortcut · " + common
 	case tabCluster:
 		return "↑↓ partition · t/enter node terminal there · j Jupyter there · " + common
+	case tabJobs:
+		if m.filtering {
+			return "type a name glob · enter/esc done"
+		}
+		return "↑↓ select · l/enter follow output (Ctrl+C to come back) · / filter by name · " + common
 	case tabSessions:
 		return "↑↓ select · a/enter attach · x stop · g clean up · " + common
 	case tabSettings:
@@ -892,8 +978,9 @@ func (m model) viewJobs(height int) string {
 		return mutedSt.Render("No host configured.")
 	}
 	var b strings.Builder
+	jobs := m.visibleJobs()
 	running, cpus, gpus := 0, 0, 0
-	for _, j := range m.jobs {
+	for _, j := range jobs {
 		if j.State == "RUNNING" {
 			running++
 			n, _ := strconv.Atoi(j.CPUs)
@@ -901,53 +988,94 @@ func (m model) viewJobs(height int) string {
 			gpus += j.GPUs()
 		}
 	}
-	summary := fmt.Sprintf("%s, %d running using %s", slurm.Plural(len(m.jobs), "job"), running, slurm.Plural(cpus, "CPU"))
+	summary := fmt.Sprintf("%s, %d running using %s", slurm.Plural(len(jobs), "job"), running, slurm.Plural(cpus, "core"))
 	if gpus > 0 {
 		summary += " and " + slurm.Plural(gpus, "GPU")
 	}
-	b.WriteString(accentSt.Render("Your jobs") + "  " + mutedSt.Render(summary) + "\n")
-	if len(m.jobs) == 0 {
+	b.WriteString(accentSt.Render("Your jobs") + "  " + mutedSt.Render(summary))
+	if m.filtering || m.filter.Value() != "" {
+		b.WriteString("   " + m.filter.View())
+	}
+	b.WriteString("\n")
+	if len(jobs) == 0 {
 		b.WriteString(mutedSt.Render("  no jobs") + "\n")
 		return b.String()
 	}
-	maxRows := max(1, height-6)
+
+	showGPUs := false
+	for _, j := range jobs {
+		showGPUs = showGPUs || j.GPUs() > 0
+	}
+	sel := m.cursor[tabJobs]
+	maxRows := max(1, height-14)
+	headers := []string{"JOB", "NAME", "STATE", "CORES", "TIME / LIMIT", "NODE (REASON)", "LAST OUTPUT", "PROGRESS"}
+	if showGPUs {
+		headers = append(headers[:4], append([]string{"GPUs"}, headers[4:]...)...)
+	}
 	rows := [][]string{}
-	for i, j := range m.jobs {
-		if i == maxRows {
-			rows = append(rows, []string{"…", fmt.Sprintf("%d more", len(m.jobs)-maxRows), "", "", "", "", "", "", ""})
-			break
+	first := max(0, min(sel-maxRows/2, len(jobs)-maxRows))
+	for i := first; i < len(jobs) && i < first+maxRows; i++ {
+		j := jobs[i]
+		last, prog := "", ""
+		if l, ok := m.live[j.ID]; ok {
+			if age, ok := l.LastOutputAge(); ok {
+				last = slurm.HumanDuration(age) + " ago"
+			}
+			prog = l.ProgressText()
 		}
-		mem := j.Mem
-		if mem == "0" {
-			mem = "default"
+		row := []string{j.ID, j.Name, j.State, j.CPUs, j.Time + " / " + j.TimeLimit, j.NodeList, last, prog}
+		if showGPUs {
+			g := "-"
+			if n := j.GPUs(); n > 0 {
+				g = strconv.Itoa(n)
+			}
+			row = append(row[:4], append([]string{g}, row[4:]...)...)
 		}
-		g := "-"
-		if n := j.GPUs(); n > 0 {
-			g = strconv.Itoa(n)
-		}
-		rows = append(rows, []string{j.ID, j.Partition, j.Name, j.State, j.CPUs, mem, g, j.Time + " / " + j.TimeLimit, j.NodeList})
+		rows = append(rows, row)
 	}
 	t := table.New().
 		Border(lipgloss.RoundedBorder()).
 		BorderStyle(mutedSt).
-		Headers("JOB", "PARTITION", "NAME", "STATE", "CPUs", "MEMORY", "GPUs", "TIME / LIMIT", "NODES (REASON)").
+		Headers(headers...).
 		Rows(rows...).
 		StyleFunc(func(row, col int) lipgloss.Style {
 			st := lipgloss.NewStyle().Padding(0, 1)
 			if row == table.HeaderRow {
 				return st.Bold(true).Foreground(accent)
 			}
-			if col == 3 && row >= 0 && row < len(rows) {
-				switch rows[row][3] {
+			if row+first == sel {
+				st = st.Bold(true).Foreground(accent)
+			}
+			if col == 2 && row >= 0 && row < len(rows) && row+first != sel {
+				switch rows[row][2] {
 				case "RUNNING":
 					return st.Foreground(good)
 				case "PENDING":
 					return st.Foreground(warn)
 				}
 			}
+			if headers[col] == "PROGRESS" && row >= 0 && row < len(rows) && strings.Contains(rows[row][col], "past limit") {
+				return st.Foreground(bad)
+			}
 			return st
 		})
-	b.WriteString(t.Render())
+	b.WriteString(t.Render() + "\n")
+	if len(jobs) > maxRows {
+		b.WriteString(mutedSt.Render(fmt.Sprintf("  showing %d-%d of %d", first+1, min(first+maxRows, len(jobs)), len(jobs))) + "\n")
+	}
+
+	// The selected job's recent output.
+	if sel < len(jobs) {
+		j := jobs[sel]
+		if l, ok := m.live[j.ID]; ok && len(l.Tail) > 0 {
+			b.WriteString("\n" + accentSt.Render("Output of "+j.ID) + "  " + mutedSt.Render(l.StdOut) + "\n")
+			for _, line := range l.Tail[max(0, len(l.Tail)-6):] {
+				b.WriteString(mutedSt.Render(truncate("  "+line, m.width)) + "\n")
+			}
+		} else if j.State == "PENDING" {
+			b.WriteString("\n" + mutedSt.Render("  "+j.ID+" is waiting: "+strings.Trim(j.NodeList, "()")) + "\n")
+		}
+	}
 	return b.String()
 }
 

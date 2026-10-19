@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/lunar-photon/cluster/internal/config"
 	"github.com/lunar-photon/cluster/internal/lifecycle"
@@ -20,19 +21,29 @@ import (
 )
 
 func initCmd(g *globals) *cobra.Command {
-	return &cobra.Command{
+	var yes bool
+	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Set up the config by asking the cluster what you're allowed to use",
 		Long: `Interactively create the config file. Host suggestions come from
 ~/.ssh/config; accounts, QOS and partitions come from the cluster itself
-(sacctmgr and sinfo), so you pick from what you actually have access to.`,
+(sacctmgr and sinfo), so you pick from what you actually have access to.
+
+Without a terminal it doesn't ask: pass --yes to accept the values it
+detects (with --host if no host is configured yet).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := g.load()
 			if err != nil {
 				return err
 			}
-			in := bufio.NewReader(os.Stdin)
+			var in *bufio.Reader // nil: accept every suggested value
+			if !yes {
+				if !term.IsTerminal(int(os.Stdin.Fd())) {
+					return fmt.Errorf("cluster init asks questions and there's no terminal; pass --yes to accept the detected values")
+				}
+				in = bufio.NewReader(os.Stdin)
+			}
 			if cfg.Legacy {
 				fmt.Println("Starting from your old shell-style config.")
 			}
@@ -117,9 +128,16 @@ func initCmd(g *globals) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "accept the detected values without asking")
+	return cmd
 }
 
+// ask prompts for a value; with in == nil (--yes) it takes the default.
 func ask(in *bufio.Reader, prompt, def string) string {
+	if in == nil {
+		fmt.Printf("%s: %s\n", prompt, def)
+		return def
+	}
 	if def != "" {
 		fmt.Printf("%s [%s]: ", prompt, def)
 	} else {
@@ -137,6 +155,9 @@ func ask(in *bufio.Reader, prompt, def string) string {
 }
 
 func askInt(in *bufio.Reader, prompt string, def int) int {
+	if in == nil {
+		return def
+	}
 	for {
 		s := ask(in, prompt, strconv.Itoa(def))
 		if n, err := strconv.Atoi(s); err == nil && n >= 0 {

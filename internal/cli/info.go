@@ -14,7 +14,8 @@ import (
 )
 
 func infoCmd(g *globals) *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	cmd := &cobra.Command{
 		Use:     "info [PARTITION]",
 		Aliases: []string{"partitions", "specs"},
 		Short:   "Show partitions, node specs, free resources and your limits",
@@ -41,6 +42,18 @@ at the top. Give a partition name for its full detail.`,
 			if p, err := e.Cfg.Profile(""); err == nil {
 				info.PreferredQOS = p.QOS
 			}
+			if asJSON {
+				j := clusterJSON(e.Cfg.Host, info)
+				if len(args) == 1 {
+					for _, p := range j.Partitions {
+						if p.Name == args[0] {
+							return printJSON(p)
+						}
+					}
+					return fmt.Errorf("no partition %q", args[0])
+				}
+				return printJSON(j)
+			}
 			if len(args) == 1 {
 				for _, s := range info.Summarize() {
 					if s.Name == args[0] {
@@ -56,6 +69,127 @@ at the top. Give a partition name for its full detail.`,
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "machine-readable output")
+	return cmd
+}
+
+// ---- JSON shapes (stable field names) ----
+
+type nodeTypeJSON struct {
+	Count          int     `json:"count"`
+	CPUs           int     `json:"cpus"`
+	Sockets        int     `json:"sockets"`
+	CoresPerSocket int     `json:"cores_per_socket"`
+	ThreadsPerCore int     `json:"threads_per_core"`
+	MemGB          float64 `json:"mem_gb"`
+	GPUs           int     `json:"gpus"`
+	GPUType        string  `json:"gpu_type,omitempty"`
+}
+
+type countJSON struct {
+	Total int `json:"total"`
+	Free  int `json:"free"`
+}
+
+type partitionJSON struct {
+	Name           string   `json:"name"`
+	Default        bool     `json:"default"`
+	State          string   `json:"state"`
+	Allowed        bool     `json:"allowed"`
+	AllowedViaQOS  []string `json:"allowed_via_qos,omitempty"`
+	WhyNot         string   `json:"why_not,omitempty"`
+	JobQOS         string   `json:"job_qos,omitempty"`
+	TimeLimit      string   `json:"time_limit"`
+	MaxNodesPerJob string   `json:"max_nodes_per_job"`
+	Nodes          struct {
+		Total       int      `json:"total"`
+		Idle        int      `json:"idle"`
+		PartlyUsed  int      `json:"partly_used"`
+		Full        int      `json:"full"`
+		Unavailable int      `json:"unavailable"`
+		IdleNames   []string `json:"idle_names"`
+		DownNames   []string `json:"unavailable_names"`
+	} `json:"nodes"`
+	CPUs            countJSON      `json:"cpus"`
+	GPUs            countJSON      `json:"gpus"`
+	MostCoresOnNode int            `json:"most_free_cores_on_one_node"`
+	AvailableToYou  *availableJSON `json:"available_to_you,omitempty"`
+	NodeTypes       []nodeTypeJSON `json:"node_types"`
+}
+
+type availableJSON struct {
+	CPUs      int    `json:"cpus"`
+	Nodes     int    `json:"nodes"`
+	GPUs      int    `json:"gpus"`
+	LimitedBy string `json:"limited_by"`
+}
+
+type qosJSON struct {
+	Name            string `json:"name"`
+	MaxCPUsPerUser  int    `json:"max_cpus_per_user,omitempty"`
+	MaxNodesPerUser int    `json:"max_nodes_per_user,omitempty"`
+	MaxGPUsPerUser  int    `json:"max_gpus_per_user,omitempty"`
+	MaxWall         string `json:"max_wall,omitempty"`
+	UsedCPUs        int    `json:"used_cpus"`
+	UsedNodes       int    `json:"used_nodes"`
+	UsedGPUs        int    `json:"used_gpus"`
+}
+
+type clusterInfoJSON struct {
+	User       string          `json:"user"`
+	Host       string          `json:"host"`
+	Accounts   []string        `json:"accounts"`
+	QOS        []qosJSON       `json:"qos"`
+	MemTracked bool            `json:"memory_reserved_per_job"`
+	Partitions []partitionJSON `json:"partitions"`
+}
+
+func clusterJSON(host string, info *slurm.Info) clusterInfoJSON {
+	j := clusterInfoJSON{User: info.User, Host: host, MemTracked: info.MemTracked, Accounts: []string{}, QOS: []qosJSON{}}
+	usage := info.Usage()
+	seenA, seenQ := map[string]bool{}, map[string]bool{}
+	for _, a := range info.Assocs {
+		if !seenA[a.Account] {
+			seenA[a.Account] = true
+			j.Accounts = append(j.Accounts, a.Account)
+		}
+		for _, q := range a.QOS {
+			if seenQ[q] {
+				continue
+			}
+			seenQ[q] = true
+			l := info.QOS[q].MaxTRESPerUserParsed
+			u := usage[q]
+			j.QOS = append(j.QOS, qosJSON{Name: q, MaxCPUsPerUser: l["cpu"], MaxNodesPerUser: l["node"],
+				MaxGPUsPerUser: l["gres/gpu"], MaxWall: info.QOS[q].MaxWall, UsedCPUs: u.CPUs, UsedNodes: u.Nodes, UsedGPUs: u.GPUs})
+		}
+	}
+	for _, s := range info.Summarize() {
+		p := partitionJSON{Name: s.Name, Default: s.Default, State: s.State, Allowed: s.Allowed, AllowedViaQOS: s.AllowedVia,
+			WhyNot: s.Why, TimeLimit: slurm.Unlimited(s.MaxTime), MaxNodesPerJob: slurm.Unlimited(s.MaxNodes),
+			CPUs: countJSON{s.CPUsTotal, s.CPUsFree}, GPUs: countJSON{s.GPUsTotal, s.GPUsFree}, MostCoresOnNode: s.BestFreeCPUs}
+		if s.Allowed {
+			p.JobQOS = info.QOSFor(s)
+			a := info.AvailableTo(s)
+			p.AvailableToYou = &availableJSON{a.CPUs, a.Nodes, a.GPUs, a.LimitedBy}
+		}
+		p.Nodes.Total = len(s.Nodes)
+		p.Nodes.Idle, p.Nodes.PartlyUsed, p.Nodes.Full, p.Nodes.Unavailable = s.Idle, s.Mixed, s.Allocated, s.Unavailable
+		p.Nodes.IdleNames, p.Nodes.DownNames = nonNil(s.IdleNodes), nonNil(s.DownNodes)
+		for _, sh := range s.Shapes {
+			p.NodeTypes = append(p.NodeTypes, nodeTypeJSON{sh.Count, sh.CPUs, sh.Sockets, sh.CoresPerSocket,
+				sh.ThreadsPerCore, float64(sh.MemMB) / 1024, sh.GPUs, sh.GPUType})
+		}
+		j.Partitions = append(j.Partitions, p)
+	}
+	return j
+}
+
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 func printInfo(w io.Writer, host string, info *slurm.Info) {
