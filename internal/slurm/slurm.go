@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/lunar-photon/cluster/internal/config"
 	"github.com/lunar-photon/cluster/internal/remote"
@@ -73,6 +74,7 @@ type Job struct {
 	Mem       string // minimum memory requested, e.g. "8G"; "0" means the default
 	GRES      string // e.g. "gres:gpu:1"; "N/A" when none
 	Comment   string
+	Submit    time.Time // when it was submitted; zero if unknown
 }
 
 // ByCluster reports whether this tool submitted the job.
@@ -104,7 +106,7 @@ func New(r *remote.Client) *Client { return &Client{R: r} }
 
 const sep = "\x1f" // ASCII unit separator: cannot appear in job names typed at a shell
 
-var squeueFormat = strings.Join([]string{"%i", "%P", "%j", "%u", "%T", "%M", "%l", "%D", "%R", "%C", "%m", "%b", "%k"}, sep)
+var squeueFormat = strings.Join([]string{"%i", "%P", "%j", "%u", "%T", "%M", "%l", "%D", "%R", "%C", "%m", "%b", "%k", "%V"}, sep)
 
 // Jobs lists the current user's jobs. With ids, it lists only those jobs.
 func (c *Client) Jobs(ctx context.Context, ids ...string) ([]Job, error) {
@@ -137,6 +139,9 @@ func parseSqueueText(out string) []Job {
 		}
 		if len(f) >= 13 {
 			j.Comment = f[12]
+		}
+		if len(f) >= 14 {
+			j.Submit = parseSlurmTime(f[13])
 		}
 		jobs = append(jobs, j)
 	}

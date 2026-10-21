@@ -173,6 +173,14 @@ type model struct {
 	live      map[string]slurm.Live // output state of running jobs
 	filter    textinput.Model       // job-name glob for the Jobs tab
 	filtering bool
+
+	// skew is the cluster's clock minus ours, so live timers match Slurm's.
+	skew time.Duration
+	// stream follows the selected running job's output while the Jobs tab
+	// is open; streamLines/streamAt are what it has delivered.
+	stream      *outStream
+	streamLines []string
+	streamAt    time.Time
 }
 
 // Run starts the dashboard. r may be nil when no host is configured.
@@ -199,7 +207,10 @@ func Run(cfg config.Config, r *remote.Client, self string) error {
 		m.status = "No cluster host configured — fill in Host and press Ctrl+S (or run `cluster init`)."
 	}
 	m.mounted = mount.IsMounted(cfg.LocalMountPoint())
-	_, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
+	final, err := tea.NewProgram(m, tea.WithAltScreen()).Run()
+	if fm, ok := final.(model); ok && fm.stream != nil {
+		fm.stream.stop()
+	}
 	return err
 }
 
@@ -207,8 +218,9 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(m.refresh(), tick(), autoRefresh())
 }
 
+// tick redraws every second for the live timers; it also rechecks the mount.
 func tick() tea.Cmd {
-	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func autoRefresh() tea.Cmd {
@@ -294,9 +306,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errMsg = ""
 			m.jobs, m.info, m.live = msg.jobs, msg.info, msg.live
 			m.sums = m.info.Summarize()
+			for _, l := range m.live {
+				if !l.Now.IsZero() {
+					m.skew = l.Now.Sub(time.Now()).Round(time.Second)
+					break
+				}
+			}
 		}
 		m.sessions = msg.sessions
 		m.clampCursors()
+		cmd := m.syncStream() // before returning m: it updates m
+		return m, cmd
+
+	case streamMsg:
+		if msg.s != m.stream {
+			return m, nil // from a stream already replaced
+		}
+		m.streamLines = append(m.streamLines, msg.lines...)
+		if over := len(m.streamLines) - 300; over > 0 {
+			m.streamLines = append([]string(nil), m.streamLines[over:]...)
+		}
+		m.streamAt = time.Now()
+		return m, m.stream.listen()
+
+	case streamEndMsg:
+		if msg.s == m.stream {
+			m.stream = nil // restarted on the next refresh if the job still runs
+		}
 		return m, nil
 
 	case execDoneMsg:
@@ -309,15 +345,94 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.refresh()
 
 	case tea.KeyMsg:
-		if m.editing {
-			return m.updateEditing(msg)
+		var next tea.Model
+		var cmd tea.Cmd
+		switch {
+		case m.editing:
+			next, cmd = m.updateEditing(msg)
+		case m.filtering:
+			next, cmd = m.updateFilter(msg)
+		default:
+			next, cmd = m.updateKeys(msg)
 		}
-		if m.filtering {
-			return m.updateFilter(msg)
-		}
-		return m.updateKeys(msg)
+		nm := next.(model)
+		scmd := nm.syncStream() // before returning nm: it updates nm
+		return nm, tea.Batch(cmd, scmd)
 	}
 	return m, nil
+}
+
+// syncStream keeps exactly one output stream: for the selected running job
+// while the Jobs tab is shown, none otherwise.
+func (m *model) syncStream() tea.Cmd {
+	want, path := "", ""
+	if m.tab == tabJobs && m.env != nil {
+		if jobs := m.visibleJobs(); m.cursor[tabJobs] < len(jobs) {
+			j := jobs[m.cursor[tabJobs]]
+			if l, ok := m.live[j.ID]; ok && j.State == "RUNNING" && l.StdOut != "" {
+				want, path = j.ID, l.StdOut
+			}
+		}
+	}
+	if m.stream != nil && m.stream.jobID == want {
+		return nil
+	}
+	if m.stream != nil {
+		m.stream.stop()
+		m.stream = nil
+	}
+	m.streamLines, m.streamAt = nil, time.Time{}
+	if want == "" {
+		return nil
+	}
+	s, err := startStream(m.env.R, want, path, 30)
+	if err != nil {
+		return nil // the 30-second snapshot still shows the output
+	}
+	m.stream = s
+	return s.listen()
+}
+
+// clusterNow is the cluster's current time.
+func (m model) clusterNow() time.Time { return time.Now().Add(m.skew) }
+
+// liveJob is a running job's output state brought up to this second, with
+// anything the stream delivered since the last refresh.
+func (m model) liveJob(id string) (slurm.Live, bool) {
+	l, ok := m.live[id]
+	if !ok {
+		return l, false
+	}
+	l.Now = m.clusterNow()
+	if m.stream != nil && m.stream.jobID == id && len(m.streamLines) > 0 {
+		l.Tail = m.streamLines
+		if p := slurm.ParseProgress(m.streamLines); p != nil {
+			l.Progress = p
+		}
+		if at := m.streamAt.Add(m.skew); at.After(l.MTime) {
+			l.MTime = at
+		}
+	}
+	return l, true
+}
+
+// timeCell is the live TIME / LIMIT text: elapsed and left for running jobs,
+// time waited for pending ones. near is true in a running job's last 10
+// minutes.
+func timeCell(j slurm.Job, l slurm.Live, haveLive bool, now time.Time) (text string, near bool) {
+	switch {
+	case j.State == "RUNNING" && haveLive && !l.Start.IsZero():
+		elapsed := now.Sub(l.Start)
+		if l.TimeLimit <= 0 {
+			return slurm.FormatDuration(elapsed) + " / no limit", false
+		}
+		left := l.Start.Add(l.TimeLimit).Sub(now)
+		return fmt.Sprintf("%s / %s · %s left", slurm.FormatDuration(elapsed), slurm.FormatDuration(l.TimeLimit),
+			slurm.FormatDuration(left)), left < 10*time.Minute
+	case j.State == "PENDING" && !j.Submit.IsZero():
+		return "waiting " + slurm.FormatDuration(now.Sub(j.Submit)) + " · limit " + j.TimeLimit, false
+	}
+	return j.Time + " / " + j.TimeLimit, false
 }
 
 func (m model) updateKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1020,17 +1135,22 @@ func (m model) viewJobs(height int) string {
 		headers = append(headers[:4], append([]string{"GPUs"}, headers[4:]...)...)
 	}
 	rows := [][]string{}
+	near := map[int]bool{}
+	now := m.clusterNow()
 	first := max(0, min(sel-maxRows/2, len(jobs)-maxRows))
 	for i := first; i < len(jobs) && i < first+maxRows; i++ {
 		j := jobs[i]
 		last, prog := "", ""
-		if l, ok := m.live[j.ID]; ok {
+		l, haveLive := m.liveJob(j.ID)
+		if haveLive {
 			if age, ok := l.LastOutputAge(); ok {
 				last = slurm.HumanDuration(age) + " ago"
 			}
 			prog = l.ProgressText()
 		}
-		row := []string{j.ID, j.Name, j.State, j.CPUs, j.Time + " / " + j.TimeLimit, j.NodeList, last, prog}
+		tm, isNear := timeCell(j, l, haveLive, now)
+		near[len(rows)] = isNear
+		row := []string{j.ID, j.Name, j.State, j.CPUs, tm, j.NodeList, last, prog}
 		if showGPUs {
 			g := "-"
 			if n := j.GPUs(); n > 0 {
@@ -1064,6 +1184,9 @@ func (m model) viewJobs(height int) string {
 			if headers[col] == "PROGRESS" && row >= 0 && row < len(rows) && strings.Contains(rows[row][col], "past limit") {
 				return st.Foreground(bad)
 			}
+			if headers[col] == "TIME / LIMIT" && near[row] {
+				return st.Foreground(warn)
+			}
 			return st
 		})
 	b.WriteString(t.Render() + "\n")
@@ -1071,12 +1194,17 @@ func (m model) viewJobs(height int) string {
 		b.WriteString(mutedSt.Render(fmt.Sprintf("  showing %d-%d of %d", first+1, min(first+maxRows, len(jobs)), len(jobs))) + "\n")
 	}
 
-	// The selected job's recent output.
+	// The selected job's recent output, live while the stream runs.
 	if sel < len(jobs) {
 		j := jobs[sel]
-		if l, ok := m.live[j.ID]; ok && len(l.Tail) > 0 {
-			b.WriteString("\n" + accentSt.Render("Output of "+j.ID) + "  " + mutedSt.Render(l.StdOut) + "\n")
-			for _, line := range l.Tail[max(0, len(l.Tail)-6):] {
+		if l, ok := m.liveJob(j.ID); ok && len(l.Tail) > 0 {
+			label := mutedSt.Render(" (refreshed every 30 s)")
+			if m.stream != nil && m.stream.jobID == j.ID {
+				label = goodSt.Render(" ● live")
+			}
+			b.WriteString("\n" + accentSt.Render("Output of "+j.ID) + label + "  " + mutedSt.Render(l.StdOut) + "\n")
+			show := max(6, height-strings.Count(b.String(), "\n")-1)
+			for _, line := range l.Tail[max(0, len(l.Tail)-show):] {
 				b.WriteString(mutedSt.Render(truncate("  "+line, m.width)) + "\n")
 			}
 		} else if j.State == "PENDING" {
