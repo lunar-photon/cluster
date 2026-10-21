@@ -30,6 +30,14 @@ type Policy struct {
 	MaxTotalCPUs int `toml:"max_total_cpus,omitempty,omitzero"`
 }
 
+// value is the policy, or no rules when it isn't set.
+func (p *Policy) value() Policy {
+	if p == nil {
+		return Policy{}
+	}
+	return *p
+}
+
 // Empty reports whether the policy sets no rules.
 func (p Policy) Empty() bool {
 	return p.JobPrefix == "" && len(p.Partitions) == 0 && p.MaxJobs == 0 && p.MaxCPUs == 0 && p.MaxTotalCPUs == 0
@@ -123,7 +131,7 @@ func FindProject(dir string) (*Project, error) {
 
 // EffectivePolicy is the user's [policy] with the project's rules on top.
 func (c Config) EffectivePolicy() Policy {
-	p := c.Policy
+	p := c.Policy.value()
 	if c.Project != nil {
 		p = p.merge(c.Project.Policy)
 	}

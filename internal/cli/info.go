@@ -150,7 +150,7 @@ type policyJSON struct {
 // policySource names where the rules come from.
 func policySource(cfg config.Config) string {
 	switch {
-	case cfg.Project != nil && !cfg.Project.Policy.Empty() && !cfg.Policy.Empty():
+	case cfg.Project != nil && !cfg.Project.Policy.Empty() && cfg.Policy != nil && !cfg.Policy.Empty():
 		return "your config and " + config.ShortPath(cfg.Project.Path)
 	case cfg.Project != nil && !cfg.Project.Policy.Empty():
 		return config.ShortPath(cfg.Project.Path)

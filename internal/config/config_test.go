@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -131,5 +132,21 @@ func TestDefaultsNameNoSiteSpecifics(t *testing.T) {
 	}
 	if ParseLegacy("GPU_QOS=x\n").Profiles["gpu"].Partition != "" {
 		t.Error("legacy import must not invent a GPU partition name")
+	}
+}
+
+func TestNoEmptyPolicyTable(t *testing.T) {
+	data, err := Defaults().Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "[policy]") {
+		t.Errorf("an unset policy must not be written:\n%s", data)
+	}
+	c := Defaults()
+	c.Policy = &Policy{MaxJobs: 2}
+	data, _ = c.Encode()
+	if !strings.Contains(string(data), "[policy]\nmax_jobs = 2") {
+		t.Errorf("a set policy must be written:\n%s", data)
 	}
 }

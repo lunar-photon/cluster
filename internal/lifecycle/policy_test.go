@@ -36,7 +36,7 @@ func TestCheckPolicy(t *testing.T) {
 		// Only jobs with the policy's prefix count: the cluster:* job doesn't.
 		{config.Policy{JobPrefix: "pj_", MaxJobs: 1}, req("pj_exec", "batch", 1), ""},
 	} {
-		f.env.Cfg.Policy = tc.pol
+		f.env.Cfg.Policy = &tc.pol
 		err := f.env.CheckPolicy(ctx, tc.req)
 		var pe *PolicyError
 		switch {
@@ -50,7 +50,7 @@ func TestCheckPolicy(t *testing.T) {
 
 func TestPolicyRefusesBeforeSubmitting(t *testing.T) {
 	f := newFake(t, "0")
-	f.env.Cfg.Policy = config.Policy{MaxCPUs: 2}
+	f.env.Cfg.Policy = &config.Policy{MaxCPUs: 2}
 	err := f.env.StartShell(shellOpts()) // asks for 4 CPUs
 	if err == nil || !strings.Contains(err.Error(), "policy: at most 2 CPUs per job") {
 		t.Fatalf("got %v", err)

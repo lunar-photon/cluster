@@ -94,7 +94,8 @@ type Config struct {
 	JobPrefix string `toml:"job_prefix,omitempty"`
 	// Policy holds usage rules that apply everywhere; a project's
 	// .cluster.toml can add its own.
-	Policy Policy `toml:"policy,omitempty"`
+	// A pointer so an unset policy writes no empty [policy] table.
+	Policy *Policy `toml:"policy,omitempty"`
 
 	// Project is the .cluster.toml found from the working directory, if any.
 	Project *Project `toml:"-"`
@@ -241,7 +242,10 @@ func overlay(base, file Config) Config {
 	if file.JobPrefix != "" {
 		out.JobPrefix = file.JobPrefix
 	}
-	out.Policy = out.Policy.merge(file.Policy)
+	if file.Policy != nil {
+		merged := out.Policy.value().merge(*file.Policy)
+		out.Policy = &merged
+	}
 	if file.MountPoint != "" {
 		out.MountPoint = file.MountPoint
 	}
