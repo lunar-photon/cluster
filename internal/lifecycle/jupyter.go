@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -203,10 +204,14 @@ func freePort(preferred int) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func waitHTTP(ctx context.Context, url, token string) error {
+// waitHTTP waits until JupyterLab answers through the tunnel. Its first start
+// on a node can take minutes (its many files come off a network filesystem),
+// so there is no fixed deadline: it waits while the tunnel is up and, every
+// 30 seconds, while keepWaiting (which reports progress) says so.
+func waitHTTP(ctx context.Context, url, token string, tunnelUp func() bool, keepWaiting func(time.Duration) bool) error {
 	client := http.Client{Timeout: 3 * time.Second}
-	deadline := time.Now().Add(3 * time.Minute)
-	for time.Now().Before(deadline) {
+	start, lastCheck := time.Now(), time.Now()
+	for {
 		req, _ := http.NewRequestWithContext(ctx, "GET", url+"/api/status", nil)
 		req.Header.Set("Authorization", "token "+token)
 		if resp, err := client.Do(req); err == nil {
@@ -215,13 +220,21 @@ func waitHTTP(ctx context.Context, url, token string) error {
 				return nil
 			}
 		}
+		if !tunnelUp() {
+			return errors.New("the tunnel closed before JupyterLab answered")
+		}
+		if time.Since(lastCheck) >= 30*time.Second {
+			lastCheck = time.Now()
+			if !keepWaiting(time.Since(start)) {
+				return errors.New("the Jupyter job ended before JupyterLab answered")
+			}
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(time.Second):
 		}
 	}
-	return errors.New("Jupyter did not answer through the tunnel within 3 minutes")
 }
 
 func openBrowser(url string) {
@@ -324,10 +337,20 @@ func (e *Env) serveJupyter(sess session.Session, browse bool) error {
 		sess.URL = url + "/lab?token=" + sess.Token
 		_ = e.Store.Add(sess)
 
-		if err := waitHTTP(ctx, url, sess.Token); err != nil && ctx.Err() == nil {
-			e.printf("Warning: %v\n", err)
+		tunnelUp := func() bool { return tunnel.Process.Signal(syscall.Signal(0)) == nil }
+		keepWaiting := func(waited time.Duration) bool {
+			e.printf("  JupyterLab is still starting (%s so far; the first start on a node can take a few minutes)\n",
+				slurm.HumanDuration(waited))
+			c, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			_, alive, err := e.Slurm.Alive(c, sess.JobID)
+			return err != nil || alive // keep waiting if we can't tell
 		}
-		if ctx.Err() == nil {
+		werr := waitHTTP(ctx, url, sess.Token, tunnelUp, keepWaiting)
+		if werr != nil && ctx.Err() == nil {
+			e.printf("Warning: %v\n", werr)
+		}
+		if werr == nil && ctx.Err() == nil {
 			if first {
 				e.printf("\nJupyterLab: %s\n", sess.URL)
 				e.printf("Ctrl+C stops Jupyter. Closing this terminal keeps it running while kernels are open.\n")

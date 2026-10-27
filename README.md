@@ -25,6 +25,17 @@ An existing `cluster`, `cluster-tui` or `cluster-jupyter` in `~/.local/bin` is m
 
 `cluster setup` checks the cluster's Slurm version and Jupyter. If tmux is missing, it explains what tmux is for (see below) and asks before installing it into `~/.local/bin` on the cluster, with no root. The login node only downloads the official tmux, libevent and ncurses releases and checks them against pinned SHA-256 sums; the build runs on a compute node as a short job (4 CPUs, 2 GB, usually 2-3 minutes). libevent and ncurses are linked statically, so the 2 MB result runs on every node with the same OS. Run `cluster setup` again at any time, or `cluster setup --reinstall-tmux` to rebuild.
 
+If JupyterLab isn't available, `cluster setup` offers to install it the same way, with nothing needed from the cluster's internet:
+
+1. A short job finds a Python 3.9+ that runs on the compute nodes, on the default path or from a `python/*` environment module. Login nodes often have different Pythons than compute nodes.
+2. Your computer downloads JupyterLab for that Python and platform (about 50 MB of wheels) and copies it over.
+3. A compute node installs it into `~/.local/share/cluster/jupyter`.
+4. `[jupyter] setup` is set to load the module (if any) and activate that environment, unless you've set it yourself.
+
+Add packages for your notebooks with `--with numpy,matplotlib`; compute nodes usually can't install packages from inside a notebook. `--install-jupyter` installs it even if a Jupyter is already there. Your computer needs `pip` for the download.
+
+The first JupyterLab start on a node can take a few minutes while it reads its files off the network filesystem; `cluster jupyter` waits, says so, and opens the browser once it answers.
+
 `make dist` builds static binaries for Linux and macOS (amd64 and arm64).
 
 ## Commands
@@ -43,7 +54,7 @@ An existing `cluster`, `cluster-tui` or `cluster-jupyter` in `~/.local/bin` is m
 | `cluster ps` | Lists sessions this tool started and whether they are still running |
 | `cluster stop JOBID \| --all` | Cancels the job, closes tunnels, unmounts |
 | `cluster gc` | Cleans up ended sessions and lists leftover jobs `cluster` submitted |
-| `cluster setup` | Checks the cluster and offers to install tmux there |
+| `cluster setup` | Checks the cluster and offers to install tmux and JupyterLab there |
 | `cluster mount` / `unmount` | Mounts storage with sshfs until you unmount it |
 | `cluster sync push\|pull [LOCAL] [REMOTE]` | rsync, skipping `.git`, venvs and caches |
 | `cluster exec CMD...` | Runs one command on a compute node with `srun` |
@@ -210,7 +221,7 @@ Every command that submits work checks the rules first and refuses with a messag
 
 On your machine: OpenSSH, plus `sshfs` for mounting (macFUSE on macOS) and `rsync` for syncing.
 
-On the cluster: Slurm 20.11 or newer for `srun --overlap` (on older versions pass `--no-overlap`), and Jupyter on the `PATH` after your `[jupyter] setup` command runs. tmux is optional but recommended; `cluster setup` can install it. Home directories must be shared between login and compute nodes, which is the usual setup.
+On the cluster: Slurm 20.11 or newer for `srun --overlap` (on older versions pass `--no-overlap`), and Jupyter on the `PATH` after your `[jupyter] setup` command runs. tmux is optional but recommended; `cluster setup` can install both. Home directories must be shared between login and compute nodes, which is the usual setup.
 
 ## Development
 

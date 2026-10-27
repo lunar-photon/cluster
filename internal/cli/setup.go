@@ -102,33 +102,52 @@ command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || echo "miss
 `
 
 func setupCmd(g *globals) *cobra.Command {
-	var yes, skipTmux, reinstall bool
+	var yes, skipTmux, reinstall, skipJupyter, installJupyter bool
+	var with []string
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Check the cluster for what cluster needs, and offer to install tmux there",
-		Long: `Check the cluster for what cluster relies on: Slurm's version, Jupyter, and
-tmux. If tmux is missing, explain what it is for and offer to build it into
-~/.local/bin on the cluster (no root needed). The login node only downloads
-the sources; the build runs on a compute node. install.sh runs this for you.`,
+		Short: "Check the cluster for what cluster needs, and offer to install tmux and JupyterLab",
+		Long: `Check the cluster for what cluster relies on: Slurm's version, tmux and
+JupyterLab, and offer to install what's missing, without root and without
+running anything heavy on the login node. install.sh runs this for you.
+
+tmux: the login node downloads the sources; a compute node builds it into
+~/.local/bin.
+
+JupyterLab: this computer downloads it (as wheels for the cluster's Python
+3.9+ and platform), copies it over, and a compute node installs it into
+~/.local/share/cluster/jupyter, so the cluster needs no internet access.
+--with numpy,matplotlib adds packages for your notebooks; compute nodes
+usually can't install packages from inside a notebook.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			e, err := g.env()
 			if err != nil {
 				return err
 			}
-			return runSetup(e, yes, skipTmux, reinstall)
+			facts, err := runSetup(e, yes, skipTmux, reinstall)
+			if err != nil || skipJupyter {
+				return err
+			}
+			return setupJupyter(e, facts, yes, installJupyter, with)
 		},
 	}
+	cmd.Flags().BoolVar(&skipJupyter, "no-jupyter", false, "don't offer to install JupyterLab")
+	cmd.Flags().BoolVar(&installJupyter, "install-jupyter", false, "install JupyterLab even if one is already there")
+	cmd.Flags().StringSliceVar(&with, "with", nil, "extra Python packages to install alongside JupyterLab, e.g. numpy,matplotlib")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "install tmux without asking if it is missing")
 	cmd.Flags().BoolVar(&skipTmux, "no-tmux", false, "don't offer to install tmux")
 	cmd.Flags().BoolVar(&reinstall, "reinstall-tmux", false, "build and install tmux even if one is already there")
 	return cmd
 }
 
-func runSetup(e *lifecycle.Env, yes, skipTmux, reinstall bool) error {
+// runSetup reports on the cluster and handles tmux; it returns what it
+// learned about the cluster for the Jupyter step.
+func runSetup(e *lifecycle.Env, yes, skipTmux, reinstall bool) (map[string][]string, error) {
+	var facts map[string][]string
 	fmt.Printf("Checking %s...\n", e.Cfg.Host)
 	if err := e.R.EnsureMaster(); err != nil {
-		return err
+		return facts, err
 	}
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -145,9 +164,9 @@ func runSetup(e *lifecycle.Env, yes, skipTmux, reinstall bool) error {
 	out, err := e.R.Output(ctx, "bash -s", strings.NewReader(probeScript))
 	cancel()
 	if err != nil {
-		return err
+		return facts, err
 	}
-	facts := map[string][]string{}
+	facts = map[string][]string{}
 	for _, line := range strings.Split(out, "\n") {
 		if k, v, ok := strings.Cut(line, "="); ok {
 			facts[k] = append(facts[k], v)
@@ -184,17 +203,17 @@ func runSetup(e *lifecycle.Env, yes, skipTmux, reinstall bool) error {
 	if t := get("tmux"); t != "" {
 		fmt.Printf("  tmux:    %s (%s)\n", get("tmux_version"), t)
 		if !reinstall {
-			return nil
+			return facts, nil
 		}
 	} else {
 		fmt.Println("  tmux:    not installed")
 	}
 	if skipTmux {
-		return nil
+		return facts, nil
 	}
 	req, err := tmuxBuildRequest(e)
 	if err != nil {
-		return err
+		return facts, err
 	}
 	if !reinstall {
 		fmt.Print(`
@@ -212,19 +231,19 @@ usually 2-3 minutes). The result uses about 2 MB.
 	}
 	if missing := facts["missing"]; len(missing) > 0 {
 		fmt.Printf("It can't be built here: the login node lacks %s. Ask your admins for tmux.\n", strings.Join(missing, ", "))
-		return nil
+		return facts, nil
 	}
 	if !yes && !reinstall {
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
 			fmt.Println("Not asking without a terminal; run `cluster setup --yes` to install it.")
-			return nil
+			return facts, nil
 		}
 		if !confirm("Install tmux on the cluster? [Y/n] ", true) {
 			fmt.Println("Skipped. Run `cluster setup` any time to install it.")
-			return nil
+			return facts, nil
 		}
 	}
-	return buildTmux(e, req)
+	return facts, buildTmux(e, req)
 }
 
 // tmuxBuildRequest is a small allocation on the default profile's partition.

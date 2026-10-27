@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
@@ -222,5 +223,30 @@ echo 1001
 	}
 	if sess, ok, _ := f.env.Store.Get("1001"); !ok || sess.TunnelPID != 0 {
 		t.Errorf("session should remain tracked with no tunnel: %+v", sess)
+	}
+}
+
+func TestWaitHTTPWaitsForSlowStart(t *testing.T) {
+	calls := 0
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 { // not ready for the first two polls
+			w.WriteHeader(503)
+			return
+		}
+		w.Write([]byte(`{}`))
+	})}
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	go srv.Serve(l)
+	defer srv.Close()
+	url := "http://" + l.Addr().String()
+	up := func() bool { return true }
+	if err := waitHTTP(context.Background(), url, "t", up, func(time.Duration) bool { return true }); err != nil {
+		t.Fatalf("should wait until it answers: %v", err)
+	}
+	// A dead tunnel ends the wait instead of hanging.
+	err := waitHTTP(context.Background(), "http://127.0.0.1:1", "t", func() bool { return false }, func(time.Duration) bool { return true })
+	if err == nil || !strings.Contains(err.Error(), "tunnel closed") {
+		t.Errorf("dead tunnel: %v", err)
 	}
 }

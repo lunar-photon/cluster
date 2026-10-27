@@ -121,7 +121,12 @@ detects (with --host if no host is configured yet).`,
 				return err
 			}
 			fmt.Printf("\nSaved %s.\n\n", cfg.Path)
-			if err := runSetup(lifecycle.New(cfg, r), false, false, false); err != nil {
+			env := lifecycle.New(cfg, r)
+			facts, err := runSetup(env, false, false, false)
+			if err != nil {
+				return err
+			}
+			if err := setupJupyter(env, facts, false, false, nil); err != nil {
 				return err
 			}
 			fmt.Println("\nReady. Try `cluster terminal`, or just `cluster` for the dashboard.")
