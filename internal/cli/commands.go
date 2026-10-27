@@ -259,7 +259,7 @@ func gcCmd(g *globals) *cobra.Command {
 
 func jupyterCmd(g *globals) *cobra.Command {
 	var sf slurmFlags
-	var noBrowser bool
+	var noBrowser, renew bool
 	var port int
 	var dir string
 	cmd := &cobra.Command{
@@ -273,6 +273,12 @@ If the network drops, Jupyter keeps running and the tunnel is restored
 automatically. Ctrl+C stops Jupyter and releases the node, asking first if
 kernels are open. Closing the terminal keeps Jupyter running while kernels
 are open; cluster attach reopens it.
+
+Ten minutes before the time limit it warns you. With --renew, fifteen
+minutes before the limit it submits a replacement job with the same token
+and settings; when the old job ends the tunnel moves to the new one, so
+your browser tab carries on at the same address. Saved notebooks carry
+over; kernel variables don't, since the old job's processes end.
 
 Jupyter must be on the remote PATH after [jupyter] setup runs, e.g.
   [jupyter]
@@ -291,7 +297,7 @@ Jupyter must be on the remote PATH after [jupyter] setup runs, e.g.
 				dir = e.Cfg.Jupyter.Dir
 			}
 			return e.Jupyter(lifecycle.JupyterOpts{
-				Req: req, Profile: profile, Dir: dir, Port: port, Browse: !noBrowser,
+				Req: req, Profile: profile, Dir: dir, Port: port, Browse: !noBrowser, Renew: renew,
 			})
 		},
 	}
@@ -299,6 +305,7 @@ Jupyter must be on the remote PATH after [jupyter] setup runs, e.g.
 	cmd.Flags().IntVar(&port, "port", 0, "local port (default [jupyter] port, next free one if taken)")
 	cmd.Flags().StringVarP(&dir, "dir", "d", "", "remote notebook directory")
 	cmd.Flags().BoolVar(&noBrowser, "no-browser", false, "print the URL without opening a browser")
+	cmd.Flags().BoolVar(&renew, "renew", false, "before the time limit, start a replacement job with the same token so the session carries on")
 	// -s/--slurm from the bash version is now the default behavior.
 	cmd.Flags().BoolP("slurm", "s", false, "run on a compute node (default)")
 	_ = cmd.Flags().MarkHidden("slurm")

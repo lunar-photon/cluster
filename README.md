@@ -46,7 +46,7 @@ The first JupyterLab start on a node can take a few minutes while it reads its f
 | `cluster info [PARTITION]` | Partitions, node hardware, free CPUs/GPUs, and what your account and QOS let you use |
 | `cluster terminal [-g]` | **Node terminal**: allocates a node (`-g`: GPU node) and opens a shell on it |
 | `cluster terminal --mount [-g] [-b]` | **Node terminal + cluster mount**: also mounts storage at `mount_point`; `-b` opens it in your file manager |
-| `cluster jupyter [-g]` | **Jupyter session on node**: JupyterLab on a compute node, opened in your browser |
+| `cluster jupyter [-g] [--renew]` | **Jupyter session on node**: JupyterLab on a compute node, opened in your browser; `--renew` carries it past the time limit |
 | `cluster submit [OPTIONS] -- CMD...` | Syncs the project, runs CMD as a batch job, follows its output, fetches results |
 | `cluster logs [JOBID] [-f]` | Shows or follows any job's output, with progress and last-output age |
 | `cluster wait JOBID... \| --name GLOB` | Waits until jobs end; exits non-zero if any failed |
@@ -85,8 +85,8 @@ When a node terminal starts, it prints the node's hardware and what your job was
 
 `cluster` opens a dashboard with five tabs:
 
-1. **Actions:** start a node terminal (with or without the cluster mount) or a Jupyter session, mount storage, sync code. Below the list, what each button will request and whether it should start right away or queue.
-2. **Cluster:** the partition table above with free-capacity bars. The selected partition's full detail appears underneath; `t` starts a node terminal there and `j` a Jupyter session, adding the QOS the partition needs and a GPU on GPU partitions.
+1. **Actions:** start a node terminal (with or without the cluster mount) or a Jupyter session, mount storage, sync code. `j` (Jupyter) first asks which partition to use, with each one's time limit and free cores, so you can pick one that's free right now. Below the list, what each button will request and whether it should start right away or queue.
+2. **Cluster:** the partition table above with free-capacity bars. The selected partition's full detail appears underneath; `t` starts a node terminal there and `j` a Jupyter session, adding the QOS the partition needs, a GPU on GPU partitions, and a shorter time limit if your usual one is longer than the partition allows.
 3. **Jobs:** your jobs with cores, time used and limit, how long ago each last wrote output, and progress with an ETA. The selected job's latest output appears underneath; `l` follows it (Ctrl+C returns), `/` filters by name.
 4. **Sessions:** sessions this tool started; attach, stop or clean up.
 5. **Settings:** edit the config. Blank fields use the cluster's defaults.
@@ -141,6 +141,8 @@ These work for any of your jobs, including ones another tool submitted with `sba
 With tmux on the cluster, the shell runs inside a tmux session started by the batch job, so reattaching after a drop returns you to the same shell with your programs still running. If you don't have your own tmux config, the session also gets mouse scrolling and a status bar showing the job ID and the detach key. Without tmux, a reattach opens a new shell on the same node, and programs started in the old shell are gone. Pass `--no-tmux` to opt out.
 
 Jupyter runs as its own job, so kernels survive a drop and only the local tunnel restarts. Ctrl+C in the `cluster jupyter` terminal stops the server and releases the node, but asks first if kernels are open, since their variables would be lost (saved notebooks are kept). Closing the terminal keeps Jupyter running while kernels are open; `cluster attach` reopens the tunnel. The token is passed to Jupyter in the environment and never appears on a command line that other users could see with `ps`.
+
+**Time limits.** Ten minutes before a Jupyter job's time limit, `cluster jupyter` warns in the terminal and with a desktop notification. With `cluster jupyter --renew`, fifteen minutes before the limit it submits a replacement job with the same token and settings. When the old job ends, the tunnel moves to the new one on the same local port, so the browser tab carries on at the same address. Saved notebooks carry over; kernel variables don't, because the old job's processes end. The replacement counts towards any usage rules, and if the queue is busy it may start a little after the old job ends. Renewal continues after `cluster attach`.
 
 A job still ends at its time limit (`time` in the config, or `-t`), whatever is running in it.
 

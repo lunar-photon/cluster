@@ -250,3 +250,84 @@ func TestWaitHTTPWaitsForSlowStart(t *testing.T) {
 		t.Errorf("dead tunnel: %v", err)
 	}
 }
+
+// With Renew, a session near its time limit submits a replacement with the
+// same token, warns, and moves to it when the old job ends.
+func TestJupyterRenewsBeforeTimeLimit(t *testing.T) {
+	f := newFake(t)
+	old := jupyterTick
+	jupyterTick = 200 * time.Millisecond
+	defer func() { jupyterTick = old }()
+	home := os.Getenv("HOME")
+	os.MkdirAll(filepath.Join(home, ".cluster"), 0o700)
+
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/status":
+			w.Write([]byte(`{}`))
+		case "/api/kernels":
+			w.Write([]byte(`[]`))
+		}
+	})}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+	jport := l.Addr().(*net.TCPAddr).Port
+
+	bin := filepath.Join(f.dir, "bin")
+	os.WriteFile(filepath.Join(bin, "fwd.py"), []byte(fakeForward), 0o644)
+	ssh := strings.Replace(fakeSSH, `while [[ $# -gt 0 ]]; do`, `for a in "$@"; do
+  if [[ "$prev" == "-L" ]]; then IFS=: read -r _ lp h rp <<< "$a"; exec python3 "$(dirname "$0")/fwd.py" "$lp" "$h" "$rp"; fi
+  prev="$a"
+done
+while [[ $# -gt 0 ]]; do`, 1)
+	os.WriteFile(filepath.Join(bin, "ssh"), []byte(ssh), 0o755)
+	// Job IDs 1001, 1002, ...; each script is kept to compare tokens.
+	os.WriteFile(filepath.Join(bin, "sbatch"), []byte(`#!/usr/bin/env bash
+n=$(( $(cat "$FAKE/count" 2>/dev/null || echo 1000) + 1 )); echo $n > "$FAKE/count"
+cat > "$FAKE/script_$n"
+echo RUNNING > "$FAKE/job_$n"
+printf '{"host":"127.0.0.1","port":`+strconv.Itoa(jport)+`}' > "$HOME/.cluster/jupyter-$n.json"
+echo $n
+`), 0o755)
+	// Every job is 5 minutes from its 1-hour limit.
+	os.WriteFile(filepath.Join(bin, "scontrol"), []byte(`#!/usr/bin/env bash
+if [[ "$1 $2" == "show job" ]]; then echo "JobId=$4 JobName=cluster:jupyter JobState=RUNNING RunTime=00:55:00 TimeLimit=01:00:00"; exit 0; fi
+if [[ "$1 $2" == "show partition" ]]; then echo "PartitionName=$4 MaxTime=UNLIMITED State=UP"; exit 0; fi
+exit 1
+`), 0o755)
+	f.env.Cfg.Jupyter.Port = freePort(20888)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- f.env.Jupyter(JupyterOpts{Req: slurm.Request{Slurm: config.Slurm{Partition: "batch", CPUs: 1}}, Profile: "cpu", Renew: true})
+	}()
+	waitFor(t, f, "JupyterLab: http://127.0.0.1:")
+	waitFor(t, f, "Submitted replacement Jupyter job 1002")
+	waitFor(t, f, "job 1002 takes over then")
+	if a, b := f.read("script_1001"), f.read("script_1002"); a == "" || a != b {
+		t.Fatalf("the replacement must run the same script, token included")
+	}
+
+	os.Remove(filepath.Join(f.dir, "job_1001")) // the old job hits its limit
+	waitFor(t, f, "JupyterLab now runs as job 1002 at the same address")
+	if s, ok, _ := f.env.Store.Get("1002"); !ok || s.Token == "" || !s.Renew {
+		t.Errorf("1002 should be the tracked, renewing session: %+v", s)
+	}
+	if _, ok, _ := f.env.Store.Get("1001"); ok {
+		t.Error("the old job's session should be gone")
+	}
+
+	syscall.Kill(os.Getpid(), syscall.SIGINT) // no kernels open: stops at once
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("%v\n%s", err, f.out)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatalf("did not stop\n%s", f.out)
+	}
+	if !strings.Contains(f.read("cancelled"), "1002") {
+		t.Errorf("stopping should release the replacement:\n%s", f.out)
+	}
+}

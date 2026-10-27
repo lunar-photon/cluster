@@ -40,6 +40,11 @@ type Session struct {
 	TunnelPID int `json:"tunnel_pid,omitempty"`
 	// RemoteFiles are deleted on the cluster when the session is stopped.
 	RemoteFiles []string `json:"remote_files,omitempty"`
+	// Renew: before the time limit, a Jupyter session submits a replacement
+	// job with the same token and Request, so the browser carries on.
+	Renew       bool            `json:"renew,omitempty"`
+	Request     json.RawMessage `json:"request,omitempty"`
+	NotebookDir string          `json:"notebook_dir,omitempty"`
 }
 
 // Store is a JSON file guarded by an advisory lock.

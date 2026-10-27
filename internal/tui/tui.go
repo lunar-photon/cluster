@@ -49,7 +49,7 @@ var actions = []action{
 	{"T", "Node terminal (GPU)", "Same, on a GPU node", []string{"terminal", "--gpu"}},
 	{"d", "Node terminal + cluster mount", "Also mounts cluster storage locally for the session", []string{"terminal", "--mount", "--browse"}},
 	{"D", "Node terminal + cluster mount (GPU)", "Same, on a GPU node", []string{"terminal", "--mount", "--browse", "--gpu"}},
-	{"j", "Jupyter session on node", "JupyterLab on a compute node, in your browser", []string{"jupyter"}},
+	{"j", "Jupyter session on node", "JupyterLab in your browser; asks which partition", []string{"jupyter"}},
 	{"J", "Jupyter session on node (GPU)", "Same, on a GPU node", []string{"jupyter", "--gpu"}},
 	{"m", "Mount / unmount storage", "Toggle the sshfs mount", nil},
 	{"p", "Push code ->", "rsync this directory to the cluster", []string{"sync", "push"}},
@@ -168,6 +168,7 @@ type model struct {
 	status  string
 	errMsg  string
 	inputs  []textinput.Model
+	menu    *menu // the pop-up for a job or session, when open
 	editing bool
 
 	live      map[string]slurm.Live // output state of running jobs
@@ -348,6 +349,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var next tea.Model
 		var cmd tea.Cmd
 		switch {
+		case m.menu != nil:
+			next, cmd = m.updateMenu(msg)
 		case m.editing:
 			next, cmd = m.updateEditing(msg)
 		case m.filtering:
@@ -497,8 +500,13 @@ func (m model) updateKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		j := jobs[m.cursor[tabJobs]]
 		switch key {
-		case "enter", "l":
+		case "enter":
+			m.menu = jobMenu(j)
+			return m, nil
+		case "l":
 			return m, m.run("Following job "+j.ID, "logs", "-f", j.ID)
+		case "x":
+			return m.menuAction(jobMenu(j), "x")
 		}
 	case tabSessions:
 		if len(m.sessions) == 0 {
@@ -506,10 +514,13 @@ func (m model) updateKeys(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		s := m.sessions[m.cursor[tabSessions]]
 		switch key {
-		case "enter", "a":
+		case "enter":
+			m.menu = sessionMenu(s)
+			return m, nil
+		case "a":
 			return m, m.run("Attach "+s.JobID, "attach", s.JobID)
 		case "x":
-			return m, m.run("Stop "+s.JobID, "stop", s.JobID)
+			return m.menuAction(sessionMenu(s), "x") // asks before stopping
 		case "g":
 			return m, m.run("Clean up", "gc")
 		}
@@ -532,14 +543,29 @@ func (m model) inPartition(s slurm.Summary, what, sub string) (tea.Model, tea.Cm
 		m.errMsg = "You can't use " + s.Name + ": " + s.Why
 		return m, nil
 	}
+	return m, m.run(what, m.partitionArgs(s, sub)...)
+}
+
+// partitionArgs are the command-line arguments to start sub in partition s.
+func (m model) partitionArgs(s slurm.Summary, sub string) []string {
 	args := []string{sub, "-p", s.Name}
+	profile := ""
+	if sub == "jupyter" {
+		profile = m.cfg.Jupyter.Profile
+	}
+	// The usual time limit may be longer than this partition allows.
+	if p, err := m.cfg.Profile(profile); err == nil {
+		if want, limit := slurm.ParseDuration(p.Time), slurm.ParseDuration(s.MaxTime); limit > 0 && want > limit {
+			args = append(args, "-t", slurm.FormatDuration(limit))
+		}
+	}
 	if m.info != nil && len(s.AllowedVia) > 0 {
 		args = append(args, "-q", m.info.QOSFor(s))
 	}
 	if s.GPUsTotal > 0 {
 		args = append(args, "--gpus", "1")
 	}
-	return m, m.run(what, args...)
+	return args
 }
 
 // updateFilter edits the Jobs tab's name filter; enter or esc finishes.
@@ -651,6 +677,10 @@ func (m model) runAction(a action) (tea.Model, tea.Cmd) {
 		}
 		return m, m.run("Mount", "mount", "--browse")
 	}
+	if a.key == "j" && len(m.sums) > 0 {
+		m.menu = m.partitionMenu(a.label, "jupyter", m.cfg.Jupyter.Profile)
+		return m, nil
+	}
 	return m, m.run(a.label, a.args...)
 }
 
@@ -745,6 +775,9 @@ func (m model) View() string {
 		body = m.viewSettings()
 	}
 	body = lipgloss.NewStyle().Height(bodyHeight).MaxHeight(bodyHeight).Render(body)
+	if m.menu != nil {
+		body = overlay(body, m.menuView(), bodyHeight, m.width)
+	}
 	b.WriteString(body + "\n")
 
 	switch {
@@ -759,7 +792,20 @@ func (m model) View() string {
 	return b.String()
 }
 
+// menuAction runs one item of a menu directly, by its key.
+func (m model) menuAction(mn *menu, key string) (tea.Model, tea.Cmd) {
+	for _, it := range mn.items {
+		if it.key == key {
+			return it.run(m)
+		}
+	}
+	return m, nil
+}
+
 func (m model) help() string {
+	if m.menu != nil {
+		return "↑↓ select · enter choose · letter shortcut · esc close"
+	}
 	common := "tab/1-5 switch · r refresh · c connect · q quit"
 	switch m.tab {
 	case tabActions:
@@ -770,9 +816,9 @@ func (m model) help() string {
 		if m.filtering {
 			return "type a name glob · enter/esc done"
 		}
-		return "↑↓ select · l/enter follow output (Ctrl+C to come back) · / filter by name · " + common
+		return "↑↓ select · enter options · l follow output · x cancel · / filter by name · " + common
 	case tabSessions:
-		return "↑↓ select · a/enter attach · x stop · g clean up · " + common
+		return "↑↓ select · enter options · a connect · x stop · g clean up · " + common
 	case tabSettings:
 		if m.editing {
 			return "type to edit · enter/↓ next · ↑ previous · ctrl+s save · esc done"

@@ -31,6 +31,37 @@ type JupyterOpts struct {
 	Dir     string
 	Port    int
 	Browse  bool
+	// Renew submits a replacement job before the time limit (see serveJupyter).
+	Renew bool
+}
+
+// jupyterTick is how often a running session checks its job; renewal
+// switches over within one tick of the old job ending.
+var jupyterTick = 30 * time.Second
+
+// Warnings and renewal happen this long before the time limit.
+const (
+	jupyterWarnBefore  = 10 * time.Minute
+	jupyterRenewBefore = 15 * time.Minute
+)
+
+// submitJupyter submits a Jupyter job with the given token and returns its
+// session (not yet started).
+func (e *Env) submitJupyter(ctx context.Context, req slurm.Request, dir, token string) (session.Session, error) {
+	req.Name = e.Cfg.JobName("jupyter")
+	if err := e.CheckRequest(ctx, req); err != nil {
+		return session.Session{}, err
+	}
+	id, err := e.Slurm.Submit(ctx, req, jupyterScript(e.Cfg.Jupyter.Setup, dir, token), "--output=.cluster/jupyter-%j.log")
+	if err != nil {
+		return session.Session{}, err
+	}
+	raw, _ := json.Marshal(req.Slurm)
+	return session.Session{
+		Kind: session.Jupyter, Host: e.R.Host, Created: time.Now(), Token: token, JobID: id,
+		RemoteFiles: []string{".cluster/jupyter-" + id + ".log", ".cluster/jupyter-" + id + ".json"},
+		Request:     raw, NotebookDir: dir,
+	}, nil
 }
 
 // jupyterScript is the batch job that starts JupyterLab on a compute node
@@ -85,34 +116,19 @@ func (e *Env) Jupyter(o JupyterOpts) error {
 	ctx, which, stop := interrupts()
 	defer stop()
 
-	token := randHex(24)
-	sess := session.Session{
-		Kind:    session.Jupyter,
-		Host:    e.R.Host,
-		Profile: o.Profile,
-		Created: time.Now(),
-		Token:   token,
-	}
-	if o.Port != 0 {
-		sess.LocalPort = o.Port
-	}
-
 	if _, err := e.R.Output(ctx, "mkdir -p ~/.cluster && chmod 700 ~/.cluster", nil); err != nil {
 		return err
 	}
-
-	o.Req.Name = e.Cfg.JobName("jupyter")
-	if err := e.CheckRequest(ctx, o.Req); err != nil {
-		return err
-	}
-	id, err := e.Slurm.Submit(ctx, o.Req, jupyterScript(e.Cfg.Jupyter.Setup, o.Dir, token),
-		"--output=.cluster/jupyter-%j.log")
+	sess, err := e.submitJupyter(ctx, o.Req, o.Dir, randHex(24))
 	if err != nil {
 		return err
 	}
-	sess.JobID = id
-	sess.RemoteFiles = []string{".cluster/jupyter-" + id + ".log", ".cluster/jupyter-" + id + ".json"}
-	e.printf("Submitted Jupyter job %s: %s\n", id, o.Req)
+	sess.Profile, sess.LocalPort, sess.Renew = o.Profile, o.Port, o.Renew
+	e.printf("Submitted Jupyter job %s: %s\n", sess.JobID, o.Req)
+	if o.Renew {
+		e.printf("It renews itself: %s before its time limit a replacement job starts with the same token.\n",
+			slurm.HumanDuration(jupyterRenewBefore))
+	}
 	if err := e.Store.Add(sess); err != nil {
 		e.printf("Warning: could not record session: %v\n", err)
 	}
@@ -304,13 +320,79 @@ func (e *Env) keepJupyter(sess session.Session, sig os.Signal) bool {
 }
 
 // serveJupyter runs the tunnel, restarting it after network loss, until the
-// user stops Jupyter, the terminal closes, or the server goes away.
+// user stops Jupyter, the terminal closes, or the server goes away. It warns
+// before the job's time limit and, for sessions with Renew, submits a
+// replacement job with the same token beforehand and moves the tunnel to it
+// when the old job ends, so the browser tab carries on at the same address.
 func (e *Env) serveJupyter(sess session.Session, browse bool) error {
 	base := e.Cfg.Jupyter.Port
 	if sess.LocalPort != 0 {
 		base = sess.LocalPort
 	}
 	first := true
+	var (
+		jobEnd    time.Time        // when the current job hits its limit; zero until known
+		warned    bool             // the time-limit warning was given
+		next      *session.Session // the replacement job, once submitted
+		renewFail bool             // don't retry a failed renewal every tick
+		switched  bool             // the last tunnel restart followed a takeover
+	)
+	timeLeft := func(ctx context.Context) (time.Duration, bool) {
+		if jobEnd.IsZero() {
+			d, found, err := e.Slurm.JobDetail(ctx, sess.JobID)
+			if err != nil || !found || d.TimeLimit <= 0 {
+				return 0, false
+			}
+			// From the time remaining, not clock times, so a time-zone
+			// difference between here and the cluster can't skew it.
+			jobEnd = time.Now().Add(d.TimeLimit - d.RunTime)
+		}
+		return time.Until(jobEnd), true
+	}
+	renew := func(ctx context.Context) {
+		var req slurm.Request
+		if len(sess.Request) == 0 || json.Unmarshal(sess.Request, &req.Slurm) != nil {
+			renewFail = true
+			e.printf("Can't renew Jupyter job %s: it didn't record what it asked for.\n", sess.JobID)
+			return
+		}
+		ns, err := e.submitJupyter(ctx, req, sess.NotebookDir, sess.Token)
+		if err != nil {
+			renewFail = true
+			e.notify(fmt.Sprintf("Couldn't submit a replacement for Jupyter job %s (%v); it stops at its time limit.", sess.JobID, err))
+			return
+		}
+		ns.Profile, ns.LocalPort, ns.Renew = sess.Profile, sess.LocalPort, true
+		_ = e.Store.Add(ns)
+		next = &ns
+		e.printf("Submitted replacement Jupyter job %s; it takes over when %s reaches its time limit.\n", ns.JobID, sess.JobID)
+	}
+	// takeOver waits for the replacement to start and makes it the session.
+	takeOver := func() error {
+		e.printf("Jupyter job %s has ended; moving to job %s...\n", sess.JobID, next.JobID)
+		ictx, _, istop := interrupts()
+		info, err := e.waitJupyterInfo(ictx, *next)
+		istop()
+		old := sess
+		old.TunnelPID = 0
+		_ = e.Release(old)
+		if err != nil {
+			_ = e.Release(*next)
+			return err
+		}
+		sess = *next
+		sess.Node, sess.RemotePort, sess.LocalPort = info.Host, info.Port, base
+		_ = e.Store.Add(sess)
+		next, jobEnd, warned, renewFail, switched = nil, time.Time{}, false, false, true
+		return nil
+	}
+	releaseAll := func() error {
+		if next != nil {
+			_ = e.Release(*next)
+		}
+		return e.Release(sess)
+	}
+
 	for {
 		lp := freePort(base)
 		if lp != base && !first {
@@ -351,26 +433,30 @@ func (e *Env) serveJupyter(sess session.Session, browse bool) error {
 			e.printf("Warning: %v\n", werr)
 		}
 		if werr == nil && ctx.Err() == nil {
-			if first {
+			switch {
+			case first:
 				e.printf("\nJupyterLab: %s\n", sess.URL)
 				e.printf("Ctrl+C stops Jupyter. Closing this terminal keeps it running while kernels are open.\n")
 				if browse {
 					openBrowser(sess.URL)
 				}
-			} else {
+			case switched:
+				e.printf("JupyterLab now runs as job %s at the same address: %s\n", sess.JobID, sess.URL)
+			default:
 				e.printf("Tunnel restored: %s\n", sess.URL)
 			}
 		}
-		first = false
+		first, switched = false, false
 
-		// Wait for a signal, the tunnel dying, or the job ending.
+		// Wait for a signal, the tunnel dying, or the job ending; meanwhile
+		// warn before the time limit and renew if asked to.
 		const (
 			gotSignal = iota
 			tunnelDied
 			jobEnded
 		)
 		outcome := -1
-		alive := time.NewTicker(time.Minute)
+		alive := time.NewTicker(jupyterTick)
 		for outcome < 0 {
 			select {
 			case <-ctx.Done():
@@ -382,12 +468,26 @@ func (e *Env) serveJupyter(sess session.Session, browse bool) error {
 					outcome = gotSignal // Ctrl+C reaches ssh too
 				}
 			case <-alive.C:
-				c, cancel := context.WithTimeout(ctx, 20*time.Second)
+				c, cancel := context.WithTimeout(ctx, 30*time.Second)
 				_, ok, err := e.Slurm.Alive(c, sess.JobID)
-				cancel()
 				if err == nil && !ok {
 					outcome = jobEnded
+				} else if left, known := timeLeft(c); known {
+					if sess.Renew && next == nil && !renewFail && left <= jupyterRenewBefore {
+						renew(c)
+					}
+					if !warned && left <= jupyterWarnBefore {
+						warned = true
+						if next != nil {
+							e.notify(fmt.Sprintf("Jupyter job %s reaches its time limit in %s; job %s takes over then. Kernels restart, so their variables are lost; saved notebooks stay.",
+								sess.JobID, slurm.HumanDuration(left), next.JobID))
+						} else {
+							e.notify(fmt.Sprintf("Jupyter job %s reaches its time limit in %s. Save your notebooks: its kernels stop then.",
+								sess.JobID, slurm.HumanDuration(left)))
+						}
+					}
 				}
+				cancel()
 			}
 		}
 		alive.Stop()
@@ -398,14 +498,20 @@ func (e *Env) serveJupyter(sess session.Session, browse bool) error {
 		switch outcome {
 		case jobEnded:
 			stop()
-			e.printf("Jupyter job %s has ended (time limit?).\n", sess.JobID)
-			return e.Release(sess)
+			if next == nil {
+				e.printf("Jupyter job %s has ended (time limit?).\n", sess.JobID)
+				return e.Release(sess)
+			}
+			if err := takeOver(); err != nil {
+				return err
+			}
+			continue
 		case gotSignal:
 			sig := which()
 			stop()
 			if !e.keepJupyter(sess, sig) {
 				e.printf("Stopping Jupyter.\n")
-				return e.Release(sess)
+				return releaseAll()
 			}
 			if sig != os.Interrupt {
 				return nil // terminal closed; Jupyter stays up
@@ -433,8 +539,13 @@ func (e *Env) serveJupyter(sess session.Session, browse bool) error {
 		_, ok, err := e.Slurm.Alive(c, sess.JobID)
 		cancel()
 		if err == nil && !ok {
-			e.printf("Jupyter job %s ended while disconnected.\n", sess.JobID)
-			return e.Release(sess)
+			if next == nil {
+				e.printf("Jupyter job %s ended while disconnected.\n", sess.JobID)
+				return e.Release(sess)
+			}
+			if err := takeOver(); err != nil {
+				return err
+			}
 		}
 	}
 }
